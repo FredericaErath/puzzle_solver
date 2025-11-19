@@ -2,10 +2,10 @@ from preprocess import preprocess_puzzle_image, save_pieces
 
 
 def main():
-    image_path = "test_starry_night.png"
+    image_path = "starry_night_translate.rgb"
 
     # 2. preprocess
-    pieces = preprocess_puzzle_image(image_path, debug=True)
+    pieces = preprocess_puzzle_image(image_path, 800, 800, debug=True)
     print(f"detect {len(pieces)} pieces in total")
 
     # 3. check each piece
