@@ -784,9 +784,9 @@ def main():
     print("Building solver...")
     solver = PuzzleSolver(pieces, 
                             max_length_diff_ratio=0.05, 
-                            alpha = 0,
+                            alpha = 0.2,
                             max_candidates_per_edge = 10,
-                            max_match_distance = 1000,)
+                            max_match_distance = 800,)
 
     # 3. Solve puzzle
     print("Solving...")
