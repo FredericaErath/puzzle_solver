@@ -42,9 +42,20 @@ class EdgeFeatures:
     color_hist : np.ndarray
         Concatenated color histogram of B, G and R channels.
         (length = 3 * hist_bins)
+    color_profile : np.ndarray
+        1D color profile along the edge: shape (L, 3), where L is the
+        number of pixels along that edge (width for top/bottom, height
+        for left/right). Each entry is the mean BGR color at that
+        position along the edge. 
+        The profile is always stored in clockwise order around the piece:
+          top   : TL -> TR  (left to right)
+          right : TR -> BR  (top to bottom)
+          bottom: BR -> BL  (right to left)
+          left  : BL -> TL  (bottom to top)
     """
     mean_color: Tuple[float, float, float]
     color_hist: np.ndarray
+    color_profile: np.ndarray
 
 
 @dataclass
@@ -176,6 +187,12 @@ def compute_edge_features(
     For each edge we take a thin strip of pixels (e.g. 3 pixels wide) and compute:
       - mean BGR color
       - normalized color histogram per channel
+      - 1D color profile along the edge (mean BGR at each position)
+        The profile is always stored in clockwise order around the piece:
+          top   : TL -> TR  (left to right)
+          right : TR -> BR  (top to bottom)
+          bottom: BR -> BL  (right to left)
+          left  : BL -> TL  (bottom to top)
 
     Parameters
     ----------
@@ -221,6 +238,26 @@ def compute_edge_features(
             hist_list.append(hist)
 
         color_hist = np.concatenate(hist_list)
+        
+        # 1D color profile in **clockwise** order:
+        if edge_name == "top":
+            # region: (border, w, 3) -> (w, 3), left to right
+            color_profile = region.mean(axis=0)  # TL -> TR
+        elif edge_name == "right":
+            # region: (h, border, 3) -> (h, 3), top to bottom
+            color_profile = region.mean(axis=1)  # TR -> BR
+        elif edge_name == "bottom":
+            # region: (border, w, 3) -> (w, 3), left to right is BL -> BR
+            # we want BR -> BL, so reverse
+            color_profile = region.mean(axis=0)[::-1]  # BR -> BL
+        elif edge_name == "left":
+            # region: (h, border, 3) -> (h, 3), top to bottom is TL -> BL
+            # we want BL -> TL, so reverse
+            color_profile = region.mean(axis=1)[::-1]  # BL -> TL
+        else:
+            # Fallback (should not happen)
+            color_profile = region.mean(axis=0)
+
 
         features[edge_name] = EdgeFeatures(
             mean_color=(
@@ -228,7 +265,8 @@ def compute_edge_features(
                 float(mean_color[1]),
                 float(mean_color[2])
             ),
-            color_hist=color_hist
+            color_hist=color_hist,
+            color_profile=color_profile.astype(np.float32)
         )
 
     return features
