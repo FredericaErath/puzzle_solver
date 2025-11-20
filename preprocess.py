@@ -20,7 +20,7 @@ for edge matching and puzzle assembly.
 import cv2
 import numpy as np
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 import json
 import os
 import argparse
@@ -92,34 +92,122 @@ class PuzzlePiece:
 
 def order_corners(pts: np.ndarray) -> np.ndarray:
     """
-    Order four corner points to a consistent order:
-        [top-left, top-right, bottom-right, bottom-left].
+    Robustly order four corner points to [top-left, top-right, bottom-right, bottom-left].
 
-    This is required before applying a perspective transform.
+    This version avoids the tie problems of using only (x + y) and (y - x)
+    by:
+      1) sorting points by their angle around the centroid (CCW),
+      2) choosing top-left as the point with minimal (x + y),
+      3) ensuring overall CCW order.
 
     Parameters
     ----------
     pts : np.ndarray
-        Array of shape (4, 2).
+        Input points of shape (4, 2) or (4, 1, 2).
 
     Returns
     -------
     np.ndarray
-        Ordered array of shape (4, 2).
+        Ordered points of shape (4, 2): [tl, tr, br, bl].
     """
-    pts = pts.reshape(4, 2).astype(np.float32)
+    pts = np.asarray(pts, dtype=np.float32).reshape(4, 2)
 
-    # Sum of coordinates (x + y)
-    s = pts.sum(axis=1)
-    tl = pts[np.argmin(s)]
-    br = pts[np.argmax(s)]
+    # 1. Compute centroid
+    center = pts.mean(axis=0)  # (cx, cy)
 
-    # Difference (y - x)
-    diff = np.diff(pts, axis=1)
-    tr = pts[np.argmin(diff)]
-    bl = pts[np.argmax(diff)]
+    # 2. Compute angle of each point relative to centroid
+    #    atan2(y - cy, x - cx) ∈ (-pi, pi]
+    angles = np.arctan2(pts[:, 1] - center[1], pts[:, 0] - center[0])
 
-    return np.array([tl, tr, br, bl], dtype=np.float32)
+    # Sort points by angle (CCW order)
+    idx = np.argsort(angles)
+    pts_ccw = pts[idx]
+
+    # 3. Choose a canonical starting point: top-left (smallest x + y)
+    sums = pts_ccw.sum(axis=1)
+    tl_idx = np.argmin(sums)
+
+    # Rotate the array so that tl is first
+    pts_ccw = np.roll(pts_ccw, -tl_idx, axis=0)
+    # Now pts_ccw is something like [tl, ?, ?, ?] in CCW order
+
+    # 4. Ensure orientation is [tl, tr, br, bl] in CCW.
+    # Compute cross product of vectors (tl->second) x (tl->third)
+    # If negative, points are actually in clockwise order, so we flip.
+    v1 = pts_ccw[1] - pts_ccw[0]
+    v2 = pts_ccw[2] - pts_ccw[0]
+    cross = np.cross(v1, v2)
+
+    if cross < 0:
+        pts_ccw = np.array([pts_ccw[0], pts_ccw[3], pts_ccw[2], pts_ccw[1]], dtype=np.float32)
+
+    return pts_ccw
+
+
+def load_canvas_rgb(image_path: str,
+                    width: Optional[int] = None,
+                    height: Optional[int] = None) -> np.ndarray:
+    """
+    Load the puzzle canvas as a BGR image (for use with OpenCV).
+
+    - For normal image formats (png/jpg/etc.), we simply call cv2.imread,
+      which returns BGR.
+    - For raw .rgb files (CSCI 576 style), we assume planar layout:
+        [R plane][G plane][B plane],
+      each plane having (width * height) bytes.
+      We read the planes and convert them to a BGR image.
+
+    Parameters
+    ----------
+    image_path : str
+        Path to the image or raw .rgb file.
+    width : int, optional
+        Width of the raw .rgb image. Required when extension is ".rgb".
+    height : int, optional
+        Height of the raw .rgb image. Required when extension is ".rgb".
+
+    Returns
+    -------
+    np.ndarray
+        Image in BGR format (H, W, 3), ready to be used with OpenCV.
+    """
+    ext = os.path.splitext(image_path)[1].lower()
+
+    # --- Case 1: raw .rgb (planar R, G, B) ---
+    if ext == ".rgb":
+        if width is None or height is None:
+            raise ValueError(
+                "Raw .rgb file requires explicit width and height "
+                "(please pass width=..., height=...)."
+            )
+
+        # Read all bytes
+        data = np.fromfile(image_path, dtype=np.uint8)
+        expected = width * height * 3
+        if data.size != expected:
+            raise ValueError(
+                f"Size mismatch for raw .rgb: expected {expected} bytes, "
+                f"got {data.size}. Check width/height."
+            )
+
+        # Assume planar layout: [R plane][G plane][B plane]
+        # Reshape to (3, H, W): 0=R, 1=G, 2=B
+        planes = data.reshape((3, height, width))
+
+        # Convert to BGR for consistency with OpenCV
+        # B = planes[2], G = planes[1], R = planes[0]
+        img_bgr = np.stack([planes[2], planes[1], planes[0]], axis=2)  # (H, W, 3)
+
+        return img_bgr
+
+    # --- Case 2: normal image formats (png/jpg/...) ---
+    canvas_bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    if canvas_bgr is None:
+        raise FileNotFoundError(f"Cannot read image from: {image_path}")
+
+    # Already BGR, no conversion needed
+    return canvas_bgr
+
 
 
 def warp_piece(canvas: np.ndarray, corners: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -177,9 +265,9 @@ def warp_piece(canvas: np.ndarray, corners: np.ndarray) -> Tuple[np.ndarray, np.
 # ----------------------------------------------------------
 
 def compute_edge_features(
-    piece: np.ndarray,
-    border: int = 3,
-    hist_bins: int = 8
+        piece: np.ndarray,
+        border: int = 3,
+        hist_bins: int = 8
 ) -> Dict[str, EdgeFeatures]:
     """
     Compute simple features for each edge (top/right/bottom/left) of a piece.
@@ -277,10 +365,10 @@ def compute_edge_features(
 # ----------------------------------------------------------
 
 def find_pieces(
-    canvas: np.ndarray,
-    min_area_ratio: float = 0.003,
-    threshold_value: int = 10,
-    debug: bool = False
+        canvas: np.ndarray,
+        min_area_ratio: float = 0.003,
+        threshold_value: int = 10,
+        debug: bool = False
 ) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
     """
     Detect puzzle pieces by foreground segmentation instead of edges.
@@ -351,8 +439,8 @@ def find_pieces(
 
         # 5a) Compute a minimum-area bounding rectangle for this contour.
         #     This is robust even if the contour has many vertices.
-        rect = cv2.minAreaRect(cnt)        # (center, (w, h), angle)
-        box = cv2.boxPoints(rect)          # 4 corner points
+        rect = cv2.minAreaRect(cnt)  # (center, (w, h), angle)
+        box = cv2.boxPoints(rect)  # 4 corner points
         corners = np.array(box, dtype=np.float32)
 
         # 5b) Warp the piece to a neat rectangular patch.
@@ -370,8 +458,10 @@ def find_pieces(
 # ----------------------------------------------------------
 
 def preprocess_puzzle_image(
-    image_path: str,
-    debug: bool = False
+        image_path: str,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        debug: bool = False
 ) -> List[PuzzlePiece]:
     """
     Run the full preprocessing pipeline on a puzzle canvas.
@@ -380,18 +470,15 @@ def preprocess_puzzle_image(
     ----------
     image_path : str
         Path to the puzzle canvas image (e.g. 'parrot_puzzle.png').
+    width: rgb file width
+    height: rgb file height
     debug : bool, optional
         If True, prints diagnostic information.
 
     Returns
     -------
-    List[PuzzlePiece]
-        List of PuzzlePiece objects with images, masks, corner coordinates,
-        sizes, and edge features.
     """
-    canvas = cv2.imread(image_path, cv2.IMREAD_COLOR)
-    if canvas is None:
-        raise FileNotFoundError(f"Cannot read image from: {image_path}")
+    canvas = load_canvas_rgb(image_path, width=width, height=height)
 
     if debug:
         print(f"Loaded canvas from {image_path} with shape {canvas.shape}")
@@ -424,9 +511,9 @@ def preprocess_puzzle_image(
 # ----------------------------------------------------------
 
 def save_pieces(
-    pieces: List[PuzzlePiece],
-    out_dir: str,
-    save_meta: bool = True
+        pieces: List[PuzzlePiece],
+        out_dir: str,
+        save_meta: bool = True
 ) -> None:
     """
     Save each piece as an image file and optionally a JSON metadata file.
@@ -501,10 +588,22 @@ def main():
         action="store_true",
         help="Print debug information."
     )
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=None,
+        help="Width of raw .rgb image (required if image is .rgb)."
+    )
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=None,
+        help="Height of raw .rgb image (required if image is .rgb)."
+    )
 
     args = parser.parse_args()
 
-    pieces = preprocess_puzzle_image(args.image, debug=args.debug)
+    pieces = preprocess_puzzle_image(args.image, args.width, args.height, debug=args.debug)
     save_pieces(pieces, args.out_dir, save_meta=True)
 
     print(f"Done. Extracted {len(pieces)} pieces to '{args.out_dir}'.")
