@@ -173,23 +173,70 @@ class PriorityFrontierSolver:
             all_vars.append(p_vars)
         return all_vars
 
+    def _aligned_color_mse(self, pa: np.ndarray, pb: np.ndarray, max_shift: int = 3) -> Tuple[float, Optional[np.ndarray], Optional[np.ndarray]]:
+        """
+        Level 1 + 2:
+          - 在 [-max_shift, max_shift] 像素范围内做滑动对齐
+          - 在对齐后的子段上，用 Gaussian 模糊后的 LAB 计算 MSE
+        返回:
+          best_mse, best_subA, best_subB
+          若没有足够长度，返回 (1e12, None, None)
+        """
+        best_mse = 1e12
+        best_A = None
+        best_B = None
+
+        L = min(len(pa), len(pb))
+        if L < 3:
+            return best_mse, None, None
+
+        for s in range(-max_shift, max_shift + 1):
+            if s < 0:
+                # A 往右对齐 B
+                a = pa[-s:L]
+                b = pb[:L + s]
+            elif s > 0:
+                # B 往右对齐 A
+                a = pa[:L - s]
+                b = pb[s:L]
+            else:
+                a = pa[:L]
+                b = pb[:L]
+
+            if len(a) < 3:
+                continue
+
+            # Level 2：对对齐后的子段做 1D Gaussian 平滑，强调低频
+            # 形状 (len, 3) → (1, len, 3)，再还原回来
+            a_blur = cv2.GaussianBlur(a.reshape(1, -1, 3), (1, 5), 0).reshape(-1, 3)
+            b_blur = cv2.GaussianBlur(b.reshape(1, -1, 3), (1, 5), 0).reshape(-1, 3)
+
+            diff = a_blur - b_blur
+            mse = float(np.mean(np.sum(diff ** 2, axis=1)))
+
+            if mse < best_mse:
+                best_mse = mse
+                best_A = a_blur
+                best_B = b_blur
+
+        return best_mse, best_A, best_B
 
 
     def _compute_edge_diff(self, edge_a, edge_b) -> float:
         """
-        恢复原始行为：
-          - 输入: edge_a, edge_b = (pixels_line, mask_line)
-            pixels_line: shape=(L, 3) in LAB
-            mask_line: shape=(L,)
-          - 统一截断长度
-          - 过滤 mask & near-black(L<5)
-          - 可选 Gaussian blur
-          - 计算 sqrt(MSE)
+        Level 1: 允许沿边缘方向 ±2 像素的滑动对齐，缓解 warp / shrink 带来的 pixel shift。
+        Level 2: 在对齐后的子段上，对 LAB profile 做 1D Gaussian 平滑，突出低频结构。
+        Level 3: 在最优对齐下，加入 L 通道梯度方向相似度 (cosine) 作为辅助项。
+
+        仍保留：
+          - mask 过滤
+          - near-black (L<5) 剔除
+          - 极少有效像素时返回很大 cost
         """
         pixels_a, mask_a = edge_a
         pixels_b, mask_b = edge_b
 
-        # 长度对齐
+        # 统一长度
         L = min(len(mask_a), len(mask_b))
         if L < 3:
             return 999999.0
@@ -199,26 +246,58 @@ class PriorityFrontierSolver:
         mask_a = mask_a[:L]
         mask_b = mask_b[:L]
 
-        # 1. 有效 mask
+        # 1) 有效 mask
         valid = (mask_a > 128) & (mask_b > 128)
 
-        # 2. near-black 过滤 (L 通道 < 5)
+        # 2) near-black 过滤 (LAB 中 L 通道在索引 0)
         nb_a = pixels_a[:, 0] > 5
         nb_b = pixels_b[:, 0] > 5
         valid = valid & nb_a & nb_b
 
-        if np.sum(valid) < 3:
+        if np.sum(valid) < 5:
             return 999999.0
 
-        pA = pixels_a[valid]
-        pB = pixels_b[valid]
+        pa = pixels_a[valid]   # (N,3)
+        pb = pixels_b[valid]
 
-        if self.blur_edges and len(pA) >= 3:
-            pA = cv2.GaussianBlur(pA.reshape(-1, 1, 3), (1, 1), 0).reshape(-1, 3)
-            pB = cv2.GaussianBlur(pB.reshape(-1, 1, 3), (1, 1), 0).reshape(-1, 3)
+        # 若配置了 blur_edges，可以再做一个细微的 2D blur（与原逻辑兼容）
+        if self.blur_edges and len(pa) >= 3:
+            pa = cv2.GaussianBlur(pa.reshape(-1, 1, 3), (1, 1), 0).reshape(-1, 3)
+            pb = cv2.GaussianBlur(pb.reshape(-1, 1, 3), (1, 1), 0).reshape(-1, 3)
 
-        mse = np.mean(np.sum((pA - pB) ** 2, axis=1))
-        return float(np.sqrt(mse))
+        # ---------- Level 1 + 2: 对齐 + 低频 MSE ----------
+        color_mse, best_A, best_B = self._aligned_color_mse(pa, pb, max_shift=2)
+        if best_A is None or best_B is None:
+            return 999999.0
+
+        # ---------- Level 3: 梯度方向相似度 ----------
+        # 使用 L 通道的一阶差分，计算 cosine 距离
+        LA = best_A[:, 0]
+        LB = best_B[:, 0]
+
+        if len(LA) > 3 and len(LB) > 3:
+            gA = np.diff(LA)
+            gB = np.diff(LB)
+
+            # 避免全 0 梯度
+            normA = float(np.linalg.norm(gA)) + 1e-6
+            normB = float(np.linalg.norm(gB)) + 1e-6
+            cos_sim = float(np.dot(gA, gB) / (normA * normB))
+            # cosine 距离: 1 - cos_sim, 范围大致 [0,2]
+            grad_cost = 1.0 - cos_sim
+        else:
+            grad_cost = 0.0
+
+        # ---------- 综合 cost ----------
+        # color_mse 是平方误差，grad_cost 是无量纲方向差，给梯度一个较小权重
+        w_color = 1.0
+        w_grad = 0.1
+
+        combined = w_color * color_mse + w_grad * grad_cost
+
+        # 保持和原逻辑一致：返回 sqrt(MSE-like)
+        return float(np.sqrt(combined + 1e-8))
+
 
 
 
