@@ -57,7 +57,7 @@ class PriorityFrontierSolver:
     def __init__(self, pieces, W, H, config, debug):
         self.pieces = pieces
         self.num_pieces = len(pieces)
-        self.W = W;
+        self.W = W
         self.H = H
         self.debug = debug
         self.blur_edges = config.get('blur', False)
@@ -117,13 +117,13 @@ class PriorityFrontierSolver:
         pixels_a, mask_a = edge_a
         pixels_b, mask_b = edge_b
         valid = (mask_a > 128) & (mask_b > 128)
-        nb_a = pixels_a[:, 0] > 5;
+        nb_a = pixels_a[:, 0] > 5
         nb_b = pixels_b[:, 0] > 5
         valid = valid & nb_a & nb_b
 
         if np.sum(valid) < 3: return 999999.0
 
-        pA = pixels_a[valid];
+        pA = pixels_a[valid]
         pB = pixels_b[valid]
         if self.blur_edges and len(pA) >= 3:
             pA = cv2.GaussianBlur(pA.reshape(-1, 1, 3), (1, 1), 0).reshape(-1, 3)
@@ -218,9 +218,9 @@ class PriorityFrontierSolver:
 
         self.grid[(r2, c2)] = v2
         self.used_pids.add(v2.pid)
-        self.min_r = min(self.min_r, r2);
+        self.min_r = min(self.min_r, r2)
         self.max_r = max(self.max_r, r2 + v2.grid_rows - 1)
-        self.min_c = min(self.min_c, c2);
+        self.min_c = min(self.min_c, c2)
         self.max_c = max(self.max_c, c2 + v2.grid_cols - 1)
 
         if self.debug: print(f"[PriorityFrontier] Seed Placed (Cost {seed_cost:.1f}).")
@@ -249,8 +249,8 @@ class PriorityFrontierSolver:
                         cand = self.variants[pid][rot]
                         if not self._is_valid_geometry(r, c, cand): continue
 
-                        total_cost = 0;
-                        count = 0;
+                        total_cost = 0
+                        count = 0
                         possible = True
                         for direction, neighbor in neighbors:
                             cost = 0
@@ -275,8 +275,10 @@ class PriorityFrontierSolver:
                                     (neighbor.edges['left'][0][:l], neighbor.edges['left'][1][:l]),
                                     (cand.edges['right'][0][:l], cand.edges['right'][1][:l]))
 
-                            if cost > 500000: possible = False; break
-                            total_cost += cost;
+                            if cost > 500000: 
+                                possible = False
+                                break
+                            total_cost += cost
                             count += 1
 
                         if possible and count > 0:
@@ -370,7 +372,7 @@ def save_result(pieces, solution, W, H, path):
 
         y, x = p.y, p.x
         h, w = img.shape[:2]
-        h_eff = min(h, final_H - y);
+        h_eff = min(h, final_H - y)
         w_eff = min(w, final_W - x)
         if h_eff <= 0 or w_eff <= 0: continue
 
@@ -387,7 +389,7 @@ def save_result(pieces, solution, W, H, path):
 
 def estimate_canvas(pieces):
     area = sum(p.size[0] * p.size[1] for p in pieces)
-    s = int(np.sqrt(area));
+    s = int(np.sqrt(area))
     return s, s
 
 
@@ -395,9 +397,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("image")
     parser.add_argument("--out", default="solved.png")
-    parser.add_argument("--target_w", type=int);
+    parser.add_argument("--target_w", type=int)
     parser.add_argument("--target_h", type=int)
-    parser.add_argument("--width", type=int);
+    parser.add_argument("--width", type=int)
     parser.add_argument("--height", type=int)
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
