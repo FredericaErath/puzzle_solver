@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict, Set
 import cv2
 import numpy as np
-from preprocess import PuzzlePiece, preprocess_puzzle_image
+from preprocess import PuzzlePiece, preprocess_puzzle_image, EdgeFeatures
 
 
 # ---------------------------------------------------------------------
@@ -38,10 +38,10 @@ class PieceInstance:
     rot: int
     h: int
     w: int
-    # Fixed names to match logic usage
     grid_rows: int
     grid_cols: int
     edges: Dict[str, Tuple[np.ndarray, np.ndarray]]
+
 
 
 @dataclass(order=True)
@@ -87,50 +87,141 @@ class PriorityFrontierSolver:
         self.min_r, self.max_r = 0, 0
         self.min_c, self.max_c = 0, 0
 
+
+    # ---------------- Edge Feature Rotation Helpers -----------------
+
+    def _flip_edge_features(self, ef: EdgeFeatures) -> EdgeFeatures:
+        """
+        翻转边缘方向（profile 和 gradient 反向），
+        mean_color / hist 不变。
+        """
+        return EdgeFeatures(
+            mean_color=ef.mean_color,
+            color_hist=ef.color_hist,
+            color_profile=ef.color_profile[::-1].copy(),
+            gradient=ef.gradient[::-1].copy(),
+        )
+
+    def _rotate_edges(self, base_edges: Dict[str, EdgeFeatures], rot: int) -> Dict[str, EdgeFeatures]:
+        """
+        根据旋转角度（0/90/180/270 CW）对四条边的 feature 做映射和翻转。
+        约定：color_profile 的正方向始终是“从左到右”或“从上到下”与
+        拼接逻辑一致。
+        """
+        if rot % 4 == 0:
+            # 0°
+            return {
+                "top":    base_edges["top"],
+                "right":  base_edges["right"],
+                "bottom": base_edges["bottom"],
+                "left":   base_edges["left"],
+            }
+        elif rot % 4 == 1:
+            # 90° CW
+            return {
+                "top":    self._flip_edge_features(base_edges["left"]),
+                "right":  base_edges["top"],
+                "bottom": self._flip_edge_features(base_edges["right"]),
+                "left":   base_edges["bottom"],
+            }
+        elif rot % 4 == 2:
+            # 180°
+            return {
+                "top":    self._flip_edge_features(base_edges["bottom"]),
+                "right":  self._flip_edge_features(base_edges["left"]),
+                "bottom": self._flip_edge_features(base_edges["top"]),
+                "left":   self._flip_edge_features(base_edges["right"]),
+            }
+        else:
+            # 270° CW (90° CCW)
+            return {
+                "top":    base_edges["right"],
+                "right":  self._flip_edge_features(base_edges["bottom"]),
+                "bottom": base_edges["left"],
+                "left":   self._flip_edge_features(base_edges["top"]),
+            }
+
     def _precompute_variants(self):
         all_vars = []
         for p in self.pieces:
             p_vars = []
-            img = p.image
-            if len(p.mask.shape) == 3:
-                msk = p.mask[:, :, 0]
-            else:
-                msk = p.mask
+
+            base_h, base_w = p.size  # (rows, cols)
+
             for r in range(4):
-                h, w = img.shape[:2]
+                # 旋转后的几何尺寸：与旧版相同
+                if r % 2 == 0:
+                    h, w = base_h, base_w
+                else:
+                    h, w = base_w, base_h
+
                 gr = max(1, int(round(h / self.unit_h)))
                 gc = max(1, int(round(w / self.unit_w)))
 
-                img_lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
-                edges = {
-                    'top': (img_lab[0, :], msk[0, :]), 'bottom': (img_lab[h - 1, :], msk[h - 1, :]),
-                    'left': (img_lab[:, 0], msk[:, 0]), 'right': (img_lab[:, w - 1], msk[:, w - 1])
-                }
-                # Fixed: pass gr, gc to grid_rows, grid_cols
-                p_vars.append(PieceInstance(p.id, r, h, w, gr, gc, edges))
-                img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
-                msk = cv2.rotate(msk, cv2.ROTATE_90_CLOCKWISE)
+                edges = p.edge_lines[r]  # ← 预处理阶段已经算好
+
+                p_vars.append(PieceInstance(
+                    pid=p.id,
+                    rot=r,
+                    h=h,
+                    w=w,
+                    grid_rows=gr,
+                    grid_cols=gc,
+                    edges=edges,
+                ))
+
             all_vars.append(p_vars)
         return all_vars
 
-    def _compute_edge_diff(self, edge_a, edge_b):
+
+
+    def _compute_edge_diff(self, edge_a, edge_b) -> float:
+        """
+        恢复原始行为：
+          - 输入: edge_a, edge_b = (pixels_line, mask_line)
+            pixels_line: shape=(L, 3) in LAB
+            mask_line: shape=(L,)
+          - 统一截断长度
+          - 过滤 mask & near-black(L<5)
+          - 可选 Gaussian blur
+          - 计算 sqrt(MSE)
+        """
         pixels_a, mask_a = edge_a
         pixels_b, mask_b = edge_b
+
+        # 长度对齐
+        L = min(len(mask_a), len(mask_b))
+        if L < 3:
+            return 999999.0
+
+        pixels_a = pixels_a[:L]
+        pixels_b = pixels_b[:L]
+        mask_a = mask_a[:L]
+        mask_b = mask_b[:L]
+
+        # 1. 有效 mask
         valid = (mask_a > 128) & (mask_b > 128)
+
+        # 2. near-black 过滤 (L 通道 < 5)
         nb_a = pixels_a[:, 0] > 5
         nb_b = pixels_b[:, 0] > 5
         valid = valid & nb_a & nb_b
 
-        if np.sum(valid) < 3: return 999999.0
+        if np.sum(valid) < 3:
+            return 999999.0
 
         pA = pixels_a[valid]
         pB = pixels_b[valid]
+
         if self.blur_edges and len(pA) >= 3:
             pA = cv2.GaussianBlur(pA.reshape(-1, 1, 3), (1, 1), 0).reshape(-1, 3)
             pB = cv2.GaussianBlur(pB.reshape(-1, 1, 3), (1, 1), 0).reshape(-1, 3)
 
         mse = np.mean(np.sum((pA - pB) ** 2, axis=1))
         return float(np.sqrt(mse))
+
+
+
 
     def _find_best_seed(self):
         best_cost = float('inf')
@@ -145,26 +236,17 @@ class PriorityFrontierSolver:
                         v2 = self.variants[j][rj]
 
                         # Right
-                        l = min(len(v1.edges['right'][0]), len(v2.edges['left'][0]))
-                        if l > 0:
-                            c = self._compute_edge_diff(
-                                (v1.edges['right'][0][:l], v1.edges['right'][1][:l]),
-                                (v2.edges['left'][0][:l], v2.edges['left'][1][:l])
-                            )
-                            if c < best_cost:
-                                best_cost = c
-                                seed = (v1, v2, 0, 0, 0, v1.grid_cols)
+                        c = self._compute_edge_diff(v1.edges['right'], v2.edges['left'])
+                        if c < best_cost:
+                            best_cost = c
+                            seed = (v1, v2, 0, 0, 0, v1.grid_cols)
 
                         # Bottom
-                        l = min(len(v1.edges['bottom'][0]), len(v2.edges['top'][0]))
-                        if l > 0:
-                            c = self._compute_edge_diff(
-                                (v1.edges['bottom'][0][:l], v1.edges['bottom'][1][:l]),
-                                (v2.edges['top'][0][:l], v2.edges['top'][1][:l])
-                            )
-                            if c < best_cost:
-                                best_cost = c
-                                seed = (v1, v2, 0, 0, v1.grid_rows, 0)
+                        c = self._compute_edge_diff(v1.edges['bottom'], v2.edges['top'])
+                        if c < best_cost:
+                            best_cost = c
+                            seed = (v1, v2, 0, 0, v1.grid_rows, 0)
+
         return seed, best_cost
 
     def _is_valid_geometry(self, r, c, inst):
@@ -255,25 +337,13 @@ class PriorityFrontierSolver:
                         for direction, neighbor in neighbors:
                             cost = 0
                             if direction == 'top':
-                                l = min(len(neighbor.edges['bottom'][0]), len(cand.edges['top'][0]))
-                                cost = self._compute_edge_diff(
-                                    (neighbor.edges['bottom'][0][:l], neighbor.edges['bottom'][1][:l]),
-                                    (cand.edges['top'][0][:l], cand.edges['top'][1][:l]))
+                                cost = self._compute_edge_diff(neighbor.edges['bottom'], cand.edges['top'])
                             elif direction == 'bottom':
-                                l = min(len(neighbor.edges['top'][0]), len(cand.edges['bottom'][0]))
-                                cost = self._compute_edge_diff(
-                                    (neighbor.edges['top'][0][:l], neighbor.edges['top'][1][:l]),
-                                    (cand.edges['bottom'][0][:l], cand.edges['bottom'][1][:l]))
+                                cost = self._compute_edge_diff(neighbor.edges['top'], cand.edges['bottom'])
                             elif direction == 'left':
-                                l = min(len(neighbor.edges['right'][0]), len(cand.edges['left'][0]))
-                                cost = self._compute_edge_diff(
-                                    (neighbor.edges['right'][0][:l], neighbor.edges['right'][1][:l]),
-                                    (cand.edges['left'][0][:l], cand.edges['left'][1][:l]))
+                                cost = self._compute_edge_diff(neighbor.edges['right'], cand.edges['left'])
                             elif direction == 'right':
-                                l = min(len(neighbor.edges['left'][0]), len(cand.edges['right'][0]))
-                                cost = self._compute_edge_diff(
-                                    (neighbor.edges['left'][0][:l], neighbor.edges['left'][1][:l]),
-                                    (cand.edges['right'][0][:l], cand.edges['right'][1][:l]))
+                                cost = self._compute_edge_diff(neighbor.edges['left'], cand.edges['right'])
 
                             if cost > 500000: 
                                 possible = False

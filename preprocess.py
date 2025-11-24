@@ -20,6 +20,7 @@ class EdgeFeatures:
     mean_color: Tuple[float, float, float]
     color_hist: np.ndarray
     color_profile: np.ndarray
+    gradient: np.ndarray
 
 @dataclass
 class PuzzlePiece:
@@ -29,6 +30,8 @@ class PuzzlePiece:
     canvas_corners: np.ndarray
     size: Tuple[int, int]
     edges: Dict[str, EdgeFeatures]
+    edge_lines: List[Dict[str, Tuple[np.ndarray, np.ndarray]]] 
+
 
 def order_corners(pts: np.ndarray) -> np.ndarray:
     pts = np.asarray(pts, dtype=np.float32).reshape(4, 2)
@@ -126,36 +129,149 @@ def analyze_raw_pieces(canvas, raw_contours):
     else:
         return {"type": "standard_rect", "mode": "rect", "shrink": 0, "desc": "Standard (Clean)"}
 
-def compute_edge_features(piece, mask, border=2):
+def compute_edge_features(piece, mask, border=2, inner_shift: int = 2):
+    """
+    为每个 piece 计算四条边的特征，使用向内偏移 inner_shift 像素的 strip，
+    避免最外圈黑边问题，并在这里完成 mask 过滤。
+
+    输出:
+      EdgeFeatures:
+        - mean_color: strip 内有效像素的 LAB 均值
+        - color_hist: LAB 直方图 (L, a, b 各 8 bin 合并)
+        - color_profile: 沿边方向的一维 LAB profile, shape = (L, 3)
+        - gradient: 沿边方向 L 通道的一阶差分 |dL/ds|, shape = (L,)
+    """
     h, w, _ = piece.shape
-    border = min(border, h//2, w//2)
-    slices = {
-        "top": (slice(0, border), slice(0, w)), "bottom": (slice(h - border, h), slice(0, w)),
-        "left": (slice(0, h), slice(0, border)), "right": (slice(0, h), slice(w - border, w))
-    }
-    features = {}
-    for edge, (ys, xs) in slices.items():
-        reg = piece[ys, xs]; msk = mask[ys, xs]
-        valid = msk > 128
-        mean_c = reg[valid].mean(axis=0) if np.any(valid) else np.array([0.,0.,0.])
+    border = min(border, max(1, h // 2 - inner_shift), max(1, w // 2 - inner_shift))
+
+    # 转 LAB，后续所有特征都基于 LAB
+    lab = cv2.cvtColor(piece, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+    def extract_edge_strip(edge: str):
+        nonlocal lab, mask, h, w, border, inner_shift
+
+        if edge == "top":
+            ys = slice(inner_shift, inner_shift + border)
+            xs = slice(0, w)
+        elif edge == "bottom":
+            ys = slice(h - inner_shift - border, h - inner_shift)
+            xs = slice(0, w)
+        elif edge == "left":
+            ys = slice(0, h)
+            xs = slice(inner_shift, inner_shift + border)
+        elif edge == "right":
+            ys = slice(0, h)
+            xs = slice(w - inner_shift - border, w - inner_shift)
+        else:
+            raise ValueError(f"Unknown edge: {edge}")
+
+        reg_lab = lab[ys, xs]      # (strip_h, strip_w, 3)
+        reg_msk = mask[ys, xs]     # (strip_h, strip_w)
+
+        valid = reg_msk > 128
+        if not np.any(valid):
+            # 没有有效像素，返回全零特征
+            mean_c = np.array([0., 0., 0.], dtype=np.float32)
+            hist = np.zeros(24, dtype=np.float32)
+            color_profile = np.zeros((reg_lab.shape[1 if edge in ("top", "bottom") else 0], 3), dtype=np.float32)
+            gradient = np.zeros(color_profile.shape[0], dtype=np.float32)
+            return mean_c, hist, color_profile, gradient
+
+        # --- 1) mean_color & histogram (LAB) ---
+        valid_pixels = reg_lab[valid]  # (N, 3)
+        mean_c = valid_pixels.mean(axis=0)
 
         hist_list = []
         for ch in range(3):
-            h_ = cv2.calcHist([reg], [ch], msk, [8], [0, 256])
+            h_ = cv2.calcHist([valid_pixels[:, ch].astype(np.float32)], [0], None, [8], [0, 256])
             hist_list.append(cv2.normalize(h_, None).flatten())
+        hist = np.concatenate(hist_list).astype(np.float32)  # 24-d
 
-        if edge == "top": prof = reg.mean(axis=0)
-        elif edge == "right": prof = reg.mean(axis=1)
-        elif edge == "bottom": prof = reg.mean(axis=0)[::-1]
-        elif edge == "left": prof = reg.mean(axis=1)[::-1]
-        else: prof = reg.mean(axis=0)
+        # --- 2) 一维 color_profile (沿边方向) ---
+        # 对于 top/bottom：沿 x 方向 (width)
+        # 对于 left/right：沿 y 方向 (height)
+        if edge in ("top", "bottom"):
+            L_len = reg_lab.shape[1]
+            color_profile = np.zeros((L_len, 3), dtype=np.float32)
+            for x in range(L_len):
+                col_valid = valid[:, x]
+                if np.any(col_valid):
+                    color_profile[x] = reg_lab[:, x, :][col_valid].mean(axis=0)
+                else:
+                    color_profile[x] = 0.0
+            if edge == "bottom":
+                color_profile = color_profile[::-1]  # 对齐方向
+        else:  # left / right
+            L_len = reg_lab.shape[0]
+            color_profile = np.zeros((L_len, 3), dtype=np.float32)
+            for y in range(L_len):
+                row_valid = valid[y, :]
+                if np.any(row_valid):
+                    color_profile[y] = reg_lab[y, :, :][row_valid].mean(axis=0)
+                else:
+                    color_profile[y] = 0.0
+            if edge == "left":
+                color_profile = color_profile[::-1]  # 对齐方向
 
+        # --- 3) gradient profile (一维 L 通道差分) ---
+        L_profile = color_profile[:, 0]  # L 通道
+        if L_profile.shape[0] > 1:
+            grad = np.abs(np.diff(L_profile, prepend=L_profile[0]))
+        else:
+            grad = np.zeros_like(L_profile)
+        gradient = grad.astype(np.float32)
+
+        return mean_c.astype(np.float32), hist, color_profile.astype(np.float32), gradient
+
+    features: Dict[str, EdgeFeatures] = {}
+    for edge in ["top", "right", "bottom", "left"]:
+        mean_c, hist, prof, grad = extract_edge_strip(edge)
         features[edge] = EdgeFeatures(
             mean_color=(float(mean_c[0]), float(mean_c[1]), float(mean_c[2])),
-            color_hist=np.concatenate(hist_list),
-            color_profile=prof.astype(np.float32)
+            color_hist=hist,
+            color_profile=prof,
+            gradient=grad,
         )
+
     return features
+
+def compute_edge_lines_for_rotations(img: np.ndarray, mask: np.ndarray):
+    """
+    为每个 piece 预计算 4 个旋转角度 (0,90,180,270 CW) 下的边缘线，
+    语义尽量与旧版 attemptA 一致：
+      - 对每个旋转，都在最外一行/列上取 LAB 像素
+      - 保留对应的 mask 一维数组
+    返回:
+      edge_sets: 长度为 4 的 list
+        edge_sets[r]: Dict[str, (pixels_line, mask_line)]
+    """
+    edge_sets: List[Dict[str, Tuple[np.ndarray, np.ndarray]]] = []
+    img_curr = img.copy()
+    msk_curr = mask.copy()
+
+    for _ in range(4):
+        img_lab = cv2.cvtColor(img_curr, cv2.COLOR_BGR2LAB).astype(np.float32)
+        h, w = img_lab.shape[:2]
+
+        if len(msk_curr.shape) == 3:
+            m = msk_curr[:, :, 0]
+        else:
+            m = msk_curr
+
+        edges = {
+            "top":    (img_lab[0, :],    m[0, :]),
+            "bottom": (img_lab[h - 1, :], m[h - 1, :]),
+            "left":   (img_lab[:, 0],    m[:, 0]),
+            "right":  (img_lab[:, w - 1], m[:, w - 1]),
+        }
+        edge_sets.append(edges)
+
+        img_curr = cv2.rotate(img_curr, cv2.ROTATE_90_CLOCKWISE)
+        msk_curr = cv2.rotate(msk_curr, cv2.ROTATE_90_CLOCKWISE)
+
+    return edge_sets
+
+
 
 def preprocess_puzzle_image(image_path, width=None, height=None, debug=False):
     canvas = load_canvas_rgb(image_path, width, height)
@@ -180,7 +296,9 @@ def preprocess_puzzle_image(image_path, width=None, height=None, debug=False):
         corners = np.array(box, dtype=np.float32)
         img, msk = warp_and_process(canvas, corners, c, mode=config['mode'], shrink_px=config['shrink'])
         edges = compute_edge_features(img, msk)
-        pieces.append(PuzzlePiece(i, img, msk, corners, img.shape[:2], edges))
+        edge_lines = compute_edge_lines_for_rotations(img, msk)
+        pieces.append(PuzzlePiece(i, img, msk, corners, img.shape[:2], edges, edge_lines))
+
 
     return pieces, config
 
