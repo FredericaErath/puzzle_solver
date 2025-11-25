@@ -18,6 +18,8 @@ import numpy as np
 from preprocess import PuzzlePiece, preprocess_puzzle_image, EdgeFeatures
 
 
+COMPLEXITY_BIAS = 1
+
 # ---------------------------------------------------------------------
 # Data Structures
 # ---------------------------------------------------------------------
@@ -41,6 +43,7 @@ class PieceInstance:
     grid_rows: int
     grid_cols: int
     edges: Dict[str, Tuple[np.ndarray, np.ndarray]]
+    edge_complexity: Dict[str, float]
 
 
 
@@ -81,6 +84,21 @@ class PriorityFrontierSolver:
             print(f"[Grid] Unit: {self.unit_w}x{self.unit_h} | Layout Limit: {self.max_rows}x{self.max_cols}")
 
         self.variants = self._precompute_variants()
+
+        # 统计全局边缘复杂度，用于归一化
+        all_complexities = []
+        for var_list in self.variants:
+            for inst in var_list:
+                all_complexities.extend(inst.edge_complexity.values())
+        if all_complexities:
+            self.edge_complexity_min = float(min(all_complexities))
+            self.edge_complexity_max = float(max(all_complexities))
+        else:
+            self.edge_complexity_min = 0.0
+            self.edge_complexity_max = 0.0
+
+        # 复杂边 bias 权重，值越大越偏好复杂边参与匹配
+        self.complexity_bias = self.blur_edges and COMPLEXITY_BIAS
 
         self.grid: Dict[Tuple[int, int], PieceInstance] = {}
         self.used_pids: Set[int] = set()
@@ -141,6 +159,41 @@ class PriorityFrontierSolver:
                 "left":   self._flip_edge_features(base_edges["top"]),
             }
 
+    def _edge_complexity_from_line(self, pixels: np.ndarray, mask: np.ndarray) -> float:
+        """
+        简单的边缘复杂度度量：
+          - 只看有效 mask 像素
+          - 用 L 通道的方差 + 一阶梯度能量
+          - 面部/衣服边缘等纹理丰富处复杂度会更高
+        """
+        if pixels is None or mask is None:
+            return 0.0
+        L = min(len(pixels), len(mask))
+        if L < 2:
+            return 0.0
+
+        pixels = pixels[:L]
+        mask = mask[:L]
+        valid = mask > 128
+        if not np.any(valid):
+            return 0.0
+
+        vals = pixels[valid]
+        if vals.shape[0] < 2:
+            return 0.0
+
+        Lch = vals[:, 0].astype(np.float32)  # LAB 的 L 通道
+        var_L = float(np.var(Lch))
+
+        if Lch.shape[0] > 1:
+            grad = np.diff(Lch)
+            grad_energy = float(np.mean(grad ** 2))
+        else:
+            grad_energy = 0.0
+
+        return var_L + grad_energy
+
+
     def _precompute_variants(self):
         all_vars = []
         for p in self.pieces:
@@ -158,7 +211,11 @@ class PriorityFrontierSolver:
                 gr = max(1, int(round(h / self.unit_h)))
                 gc = max(1, int(round(w / self.unit_w)))
 
-                edges = p.edge_lines[r]  # ← 预处理阶段已经算好
+                edges = p.edge_lines[r]  # { 'top': (pixels, mask), ... }
+
+                edge_complexity: Dict[str, float] = {}
+                for side, (px, msk) in edges.items():
+                    edge_complexity[side] = self._edge_complexity_from_line(px, msk)
 
                 p_vars.append(PieceInstance(
                     pid=p.id,
@@ -168,6 +225,7 @@ class PriorityFrontierSolver:
                     grid_rows=gr,
                     grid_cols=gc,
                     edges=edges,
+                    edge_complexity=edge_complexity,
                 ))
 
             all_vars.append(p_vars)
@@ -220,6 +278,35 @@ class PriorityFrontierSolver:
                 best_B = b_blur
 
         return best_mse, best_A, best_B
+
+
+    def _norm_edge_complexity(self, inst: PieceInstance, side: str) -> float:
+        c = float(inst.edge_complexity.get(side, 0.0))
+        if self.edge_complexity_max <= self.edge_complexity_min + 1e-6:
+            return 0.0
+        return (c - self.edge_complexity_min) / (self.edge_complexity_max - self.edge_complexity_min + 1e-6)
+
+    def _apply_complexity_bias(
+        self,
+        raw_cost: float,
+        inst_a: PieceInstance,
+        side_a: str,
+        inst_b: PieceInstance,
+        side_b: str,
+    ) -> float:
+        """
+        根据两条边的复杂度调整 cost：
+          - 复杂度越高 → 有更多纹理特征 → 更值得优先匹配
+          - 策略：raw_cost / (1 + complexity_bias * max(norm_c_a, norm_c_b))
+        """
+        if raw_cost >= 500000:
+            return raw_cost
+
+        ca = self._norm_edge_complexity(inst_a, side_a)
+        cb = self._norm_edge_complexity(inst_b, side_b)
+        pair_c = max(ca, cb)
+
+        return raw_cost / (1.0 + self.complexity_bias * pair_c)
 
 
     def _compute_edge_diff(self, edge_a, edge_b) -> float:
@@ -315,16 +402,19 @@ class PriorityFrontierSolver:
                         v2 = self.variants[j][rj]
 
                         # Right
-                        c = self._compute_edge_diff(v1.edges['right'], v2.edges['left'])
+                        raw = self._compute_edge_diff(v1.edges['right'], v2.edges['left'])
+                        c = self._apply_complexity_bias(raw, v1, 'right', v2, 'left')
                         if c < best_cost:
                             best_cost = c
                             seed = (v1, v2, 0, 0, 0, v1.grid_cols)
 
                         # Bottom
-                        c = self._compute_edge_diff(v1.edges['bottom'], v2.edges['top'])
+                        raw = self._compute_edge_diff(v1.edges['bottom'], v2.edges['top'])
+                        c = self._apply_complexity_bias(raw, v1, 'bottom', v2, 'top')
                         if c < best_cost:
                             best_cost = c
                             seed = (v1, v2, 0, 0, v1.grid_rows, 0)
+
 
         return seed, best_cost
 
@@ -682,19 +772,33 @@ class PriorityFrontierSolver:
 
                         for direction, neighbor in neighbors:
                             if direction == 'top':
-                                cost = self._compute_edge_diff(neighbor.edges['bottom'], cand_inst.edges['top'])
+                                raw_cost = self._compute_edge_diff(neighbor.edges['bottom'], cand_inst.edges['top'])
+                                if raw_cost > 500000:
+                                    possible = False
+                                    break
+                                cost = self._apply_complexity_bias(raw_cost, neighbor, 'bottom', cand_inst, 'top')
                             elif direction == 'bottom':
-                                cost = self._compute_edge_diff(neighbor.edges['top'], cand_inst.edges['bottom'])
+                                raw_cost = self._compute_edge_diff(neighbor.edges['top'], cand_inst.edges['bottom'])
+                                if raw_cost > 500000:
+                                    possible = False
+                                    break
+                                cost = self._apply_complexity_bias(raw_cost, neighbor, 'top', cand_inst, 'bottom')
                             elif direction == 'left':
-                                cost = self._compute_edge_diff(neighbor.edges['right'], cand_inst.edges['left'])
+                                raw_cost = self._compute_edge_diff(neighbor.edges['right'], cand_inst.edges['left'])
+                                if raw_cost > 500000:
+                                    possible = False
+                                    break
+                                cost = self._apply_complexity_bias(raw_cost, neighbor, 'right', cand_inst, 'left')
                             else:  # 'right'
-                                cost = self._compute_edge_diff(neighbor.edges['left'], cand_inst.edges['right'])
+                                raw_cost = self._compute_edge_diff(neighbor.edges['left'], cand_inst.edges['right'])
+                                if raw_cost > 500000:
+                                    possible = False
+                                    break
+                                cost = self._apply_complexity_bias(raw_cost, neighbor, 'left', cand_inst, 'right')
 
-                            if cost > 500000:
-                                possible = False
-                                break
                             total_cost += cost
                             count += 1
+
 
                         if possible and count > 0:
                             avg_cost = total_cost / count
