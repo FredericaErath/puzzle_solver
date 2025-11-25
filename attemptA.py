@@ -22,6 +22,9 @@ T_SEED_COMPLEXITY = 0.25      # 过滤掉过度平滑的边（归一化后 0~1�
 SEED_BIAS = 1.0               # seed 专用的 complexity bias
 COMPLEXITY_BIAS = 1.0
 
+LOOKAHEAD_K = 5
+LOOKAHEAD_DEPTH = 3
+
 # ---------------------------------------------------------------------
 # Data Structures
 # ---------------------------------------------------------------------
@@ -885,7 +888,7 @@ def auto_tune_and_solve(pieces, W, H, args_out, pre_config, lookahead = True):
     solver = PriorityFrontierSolver(pieces, W, H, config, debug=True)
 
     if lookahead:
-        sol = solver.solve_with_lookahead(K=5, depth=5)
+        sol = solver.solve_with_lookahead(K=LOOKAHEAD_K, depth=LOOKAHEAD_DEPTH)
     else:
         sol = solver.solve()
 
