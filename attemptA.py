@@ -347,6 +347,137 @@ class PriorityFrontierSolver:
         if w_span > self.max_cols: return False
 
         return True
+    
+    def _simulate_greedy_steps(self, max_depth: int) -> float:
+        """
+        在当前 self.grid/self.used_pids 状态下，向前贪心模拟 max_depth 步。
+        仅用于 lookahead 评分，不影响真实解（调用方负责备份/恢复状态）。
+
+        返回：这几步的累计 cost（若无法扩展则返回一个很大的代价）。
+        """
+        total_cost = 0.0
+        steps = 0
+
+        for _ in range(max_depth):
+            frontier_slots = self._get_frontier_slots()
+            if not frontier_slots:
+                break
+
+            heap = []
+
+            for (r, c) in frontier_slots:
+                neighbors = []
+                if (r - 1, c) in self.grid: neighbors.append(('top', self.grid[(r - 1, c)]))
+                if (r + 1, c) in self.grid: neighbors.append(('bottom', self.grid[(r + 1, c)]))
+                if (r, c - 1) in self.grid: neighbors.append(('left', self.grid[(r, c - 1)]))
+                if (r, c + 1) in self.grid: neighbors.append(('right', self.grid[(r, c + 1)]))
+
+                if not neighbors:
+                    continue
+
+                for pid in range(self.num_pieces):
+                    if pid in self.used_pids:
+                        continue
+
+                    for rot in range(4):
+                        cand = self.variants[pid][rot]
+                        if not self._is_valid_geometry(r, c, cand):
+                            continue
+
+                        total_cost_local = 0.0
+                        count = 0
+                        possible = True
+
+                        for direction, neighbor in neighbors:
+                            if direction == 'top':
+                                cost = self._compute_edge_diff(neighbor.edges['bottom'], cand.edges['top'])
+                            elif direction == 'bottom':
+                                cost = self._compute_edge_diff(neighbor.edges['top'], cand.edges['bottom'])
+                            elif direction == 'left':
+                                cost = self._compute_edge_diff(neighbor.edges['right'], cand.edges['left'])
+                            else:  # 'right'
+                                cost = self._compute_edge_diff(neighbor.edges['left'], cand.edges['right'])
+
+                            if cost > 500000:
+                                possible = False
+                                break
+                            total_cost_local += cost
+                            count += 1
+
+                        if possible and count > 0:
+                            avg_cost = total_cost_local / count
+                            heapq.heappush(heap, MoveCandidate(avg_cost, pid, rot, r, c))
+
+            if not heap:
+                break
+
+            best = heapq.heappop(heap)
+            inst = self.variants[best.pid][best.rot]
+
+            for i in range(inst.grid_rows):
+                for j in range(inst.grid_cols):
+                    self.grid[(best.row + i, best.col + j)] = inst
+
+            self.used_pids.add(best.pid)
+            self.min_r = min(self.min_r, best.row)
+            self.max_r = max(self.max_r, best.row + inst.grid_rows - 1)
+            self.min_c = min(self.min_c, best.col)
+            self.max_c = max(self.max_c, best.col + inst.grid_cols - 1)
+
+            total_cost += best.cost
+            steps += 1
+
+        if steps == 0:
+            return 1e9  # 无法扩展，视为很差
+        return total_cost
+
+    def _evaluate_candidate_with_lookahead(self, cand: MoveCandidate, depth: int) -> float:
+        """
+        对单个候选 move 进行评分：
+          1. 备份当前 solver 状态
+          2. 暂时放置这个 candidate
+          3. 再向前贪心模拟 depth-1 步，得到额外代价
+          4. 恢复原始状态
+        返回：归一化后的总评分（越小越好）
+        """
+        # 备份当前状态
+        orig_grid = self.grid.copy()
+        orig_used = self.used_pids.copy()
+        orig_min_r, orig_max_r = self.min_r, self.max_r
+        orig_min_c, orig_max_c = self.min_c, self.max_c
+
+        # 应用当前 candidate
+        inst = self.variants[cand.pid][cand.rot]
+        for i in range(inst.grid_rows):
+            for j in range(inst.grid_cols):
+                self.grid[(cand.row + i, cand.col + j)] = inst
+
+        self.used_pids.add(cand.pid)
+        self.min_r = min(self.min_r, cand.row)
+        self.max_r = max(self.max_r, cand.row + inst.grid_rows - 1)
+        self.min_c = min(self.min_c, cand.col)
+        self.max_c = max(self.max_c, cand.col + inst.grid_cols - 1)
+
+        total_cost = cand.cost
+        steps = 1
+
+        # 向前模拟 depth-1 步
+        if depth > 1:
+            extra_cost = self._simulate_greedy_steps(depth - 1)
+            if extra_cost < 1e8:
+                total_cost += extra_cost
+                steps += (depth - 1)
+
+        score = total_cost / steps
+
+        # 恢复原始状态
+        self.grid = orig_grid
+        self.used_pids = orig_used
+        self.min_r, self.max_r = orig_min_r, orig_max_r
+        self.min_c, self.max_c = orig_min_c, orig_max_c
+
+        return score
+
 
     def _get_frontier_slots(self):
         frontier = set()
@@ -484,20 +615,150 @@ class PriorityFrontierSolver:
                 ))
                 processed.add(inst.pid)
         return placements
+    
+    def solve_with_lookahead(self, K: int = 3, depth: int = 2):
+        """
+        带有限深回溯的求解：
+          - 每一步先构建所有候选 MoveCandidate
+          - 从中取 cost 最小的前 K 个
+          - 对这 K 个分别做 depth 步 lookahead 评分
+          - 选评分最小的一个真正落子
+        K 和 depth 都不宜过大，默认 K=3, depth=2 对 N≈16 的拼图一般足够。
+        """
+        print("[PriorityFrontier] Initializing with lookahead...")
+        seed, seed_cost = self._find_best_seed()
+        if not seed:
+            return None
+
+        v1, v2, r1, c1, r2, c2 = seed
+
+        # 放置 seed 的两个 piece
+        self.grid[(r1, c1)] = v1
+        self.used_pids.add(v1.pid)
+        self.min_r, self.max_r = r1, r1 + v1.grid_rows - 1
+        self.min_c, self.max_c = c1, c1 + v1.grid_cols - 1
+
+        self.grid[(r2, c2)] = v2
+        self.used_pids.add(v2.pid)
+        self.min_r = min(self.min_r, r2)
+        self.max_r = max(self.max_r, r2 + v2.grid_rows - 1)
+        self.min_c = min(self.min_c, c2)
+        self.max_c = max(self.max_c, c2 + v2.grid_cols - 1)
+
+        if self.debug:
+            print(f"[PriorityFrontier] Seed Placed (Cost {seed_cost:.1f}).")
+
+        while len(self.used_pids) < self.num_pieces:
+            frontier_slots = self._get_frontier_slots()
+            if not frontier_slots:
+                print("[PriorityFrontier] Dead end (Boxed in).")
+                break
+
+            heap = []
+
+            # 和 solve 中相同的候选生成逻辑
+            for (r, c) in frontier_slots:
+                neighbors = []
+                if (r - 1, c) in self.grid: neighbors.append(('top', self.grid[(r - 1, c)]))
+                if (r + 1, c) in self.grid: neighbors.append(('bottom', self.grid[(r + 1, c)]))
+                if (r, c - 1) in self.grid: neighbors.append(('left', self.grid[(r, c - 1)]))
+                if (r, c + 1) in self.grid: neighbors.append(('right', self.grid[(r, c + 1)]))
+
+                if not neighbors:
+                    continue
+
+                for pid in range(self.num_pieces):
+                    if pid in self.used_pids:
+                        continue
+
+                    for rot in range(4):
+                        cand_inst = self.variants[pid][rot]
+                        if not self._is_valid_geometry(r, c, cand_inst):
+                            continue
+
+                        total_cost = 0.0
+                        count = 0
+                        possible = True
+
+                        for direction, neighbor in neighbors:
+                            if direction == 'top':
+                                cost = self._compute_edge_diff(neighbor.edges['bottom'], cand_inst.edges['top'])
+                            elif direction == 'bottom':
+                                cost = self._compute_edge_diff(neighbor.edges['top'], cand_inst.edges['bottom'])
+                            elif direction == 'left':
+                                cost = self._compute_edge_diff(neighbor.edges['right'], cand_inst.edges['left'])
+                            else:  # 'right'
+                                cost = self._compute_edge_diff(neighbor.edges['left'], cand_inst.edges['right'])
+
+                            if cost > 500000:
+                                possible = False
+                                break
+                            total_cost += cost
+                            count += 1
+
+                        if possible and count > 0:
+                            avg_cost = total_cost / count
+                            heapq.heappush(heap, MoveCandidate(avg_cost, pid, rot, r, c))
+
+            if not heap:
+                print("[PriorityFrontier] No valid moves fit geometry.")
+                break
+
+            # 取前 K 个候选做 lookahead 评分
+            top_candidates = []
+            for _ in range(min(K, len(heap))):
+                top_candidates.append(heapq.heappop(heap))
+
+            best_cand = None
+            best_score = float('inf')
+
+            for cand in top_candidates:
+                score = self._evaluate_candidate_with_lookahead(cand, depth)
+                if score < best_score:
+                    best_score = score
+                    best_cand = cand
+
+            if best_cand is None:
+                print("[PriorityFrontier] Lookahead could not find a feasible move.")
+                break
+
+            # 真正落子
+            inst = self.variants[best_cand.pid][best_cand.rot]
+            for i in range(inst.grid_rows):
+                for j in range(inst.grid_cols):
+                    self.grid[(best_cand.row + i, best_cand.col + j)] = inst
+
+            self.used_pids.add(best_cand.pid)
+            self.min_r = min(self.min_r, best_cand.row)
+            self.max_r = max(self.max_r, best_cand.row + inst.grid_rows - 1)
+            self.min_c = min(self.min_c, best_cand.col)
+            self.max_c = max(self.max_c, best_cand.col + inst.grid_cols - 1)
+
+            if self.debug:
+                print(f"   -> [Lookahead] Placed P{best_cand.pid} at ({best_cand.row},{best_cand.col}) "
+                      f"Cost {best_cand.cost:.1f}, Score {best_score:.1f}")
+
+        return self._generate_final_placements()
+
 
 
 # ---------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------
 
-def auto_tune_and_solve(pieces, W, H, args_out, pre_config):
+def auto_tune_and_solve(pieces, W, H, args_out, pre_config, lookahead = True):
     print("\n[Solver v27] Priority Frontier Strategy...")
     p_type = pre_config.get('type', 'standard_rect')
     config = {'blur': False}
     if p_type == 'rotated_rect': config['blur'] = True
 
     solver = PriorityFrontierSolver(pieces, W, H, config, debug=True)
-    sol = solver.solve()
+
+    if lookahead:
+        sol = solver.solve_with_lookahead(K=3, depth=2)
+    else:
+        sol = solver.solve()
+
     if sol:
         save_result(pieces, sol, W, H, args_out)
     else:
