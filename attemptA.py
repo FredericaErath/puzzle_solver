@@ -17,8 +17,10 @@ import cv2
 import numpy as np
 from preprocess import PuzzlePiece, preprocess_puzzle_image, EdgeFeatures
 
-
-COMPLEXITY_BIAS = 1
+# ---- Hyperparameters ----
+T_SEED_COMPLEXITY = 0.25      # 过滤掉过度平滑的边（归一化后 0~1）
+SEED_BIAS = 1.0               # seed 专用的 complexity bias
+COMPLEXITY_BIAS = 1.0
 
 # ---------------------------------------------------------------------
 # Data Structures
@@ -386,37 +388,59 @@ class PriorityFrontierSolver:
         return float(np.sqrt(combined + 1e-8))
 
 
-
-
-
     def _find_best_seed(self):
-        best_cost = float('inf')
-        seed = None
+        """
+        改进 seed 选择：
+        1) 过滤掉过于平滑/背景的边（avoid low-complexity seed）
+        2) seed 阶段加更强权重，使复杂边优先被选中
+        3) 禁止两条低复杂度边互拼（避免 background-background seed）
+        """
+        best_score = float('inf')
+        best_seed = None
+
+        T_seed_complexity = T_SEED_COMPLEXITY  # 归一化后 0~1
+        seed_bias = SEED_BIAS                 # seed 专用 complexity bias
 
         for i in range(self.num_pieces):
             for ri in range(4):
                 v1 = self.variants[i][ri]
+
                 for j in range(self.num_pieces):
-                    if i == j: continue
+                    if i == j:
+                        continue
+
                     for rj in range(4):
                         v2 = self.variants[j][rj]
 
-                        # Right
-                        raw = self._compute_edge_diff(v1.edges['right'], v2.edges['left'])
-                        c = self._apply_complexity_bias(raw, v1, 'right', v2, 'left')
-                        if c < best_cost:
-                            best_cost = c
-                            seed = (v1, v2, 0, 0, 0, v1.grid_cols)
+                        # ---------- RIGHT match ----------
+                        c1 = self._norm_edge_complexity(v1, 'right')
+                        c2 = self._norm_edge_complexity(v2, 'left')
 
-                        # Bottom
+                        # 两边都太平滑 -> 不拿来做 seed 的右边匹配
+                        if not (c1 < T_seed_complexity and c2 < T_seed_complexity):
+                            raw = self._compute_edge_diff(v1.edges['right'], v2.edges['left'])
+                            seed_score = raw / (1.0 + seed_bias * max(c1, c2))
+                            if seed_score < best_score:
+                                best_score = seed_score
+                                best_seed = (v1, v2, 0, 0, 0, v1.grid_cols)
+
+                        # ---------- BOTTOM match ----------
+                        c1b = self._norm_edge_complexity(v1, 'bottom')
+                        c2b = self._norm_edge_complexity(v2, 'top')
+
+                        # 两边都太平滑 -> 直接跳过这个 bottom seed
+                        if c1b < T_seed_complexity and c2b < T_seed_complexity:
+                            continue
+
                         raw = self._compute_edge_diff(v1.edges['bottom'], v2.edges['top'])
-                        c = self._apply_complexity_bias(raw, v1, 'bottom', v2, 'top')
-                        if c < best_cost:
-                            best_cost = c
-                            seed = (v1, v2, 0, 0, v1.grid_rows, 0)
+                        seed_score = raw / (1.0 + seed_bias * max(c1b, c2b))
+                        if seed_score < best_score:
+                            best_score = seed_score
+                            best_seed = (v1, v2, 0, 0, v1.grid_rows, 0)
+
+        return best_seed, best_score
 
 
-        return seed, best_cost
 
     def _is_valid_geometry(self, r, c, inst):
         # 1. Overlap Check
@@ -737,6 +761,8 @@ class PriorityFrontierSolver:
 
         if self.debug:
             print(f"[PriorityFrontier] Seed Placed (Cost {seed_cost:.1f}).")
+            print(f"[Seed Debug] Seed pieces: P{v1.pid} and P{v2.pid}")
+
 
         while len(self.used_pids) < self.num_pieces:
             frontier_slots = self._get_frontier_slots()
@@ -859,7 +885,7 @@ def auto_tune_and_solve(pieces, W, H, args_out, pre_config, lookahead = True):
     solver = PriorityFrontierSolver(pieces, W, H, config, debug=True)
 
     if lookahead:
-        sol = solver.solve_with_lookahead(K=3, depth=2)
+        sol = solver.solve_with_lookahead(K=5, depth=5)
     else:
         sol = solver.solve()
 

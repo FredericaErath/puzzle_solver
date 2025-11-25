@@ -2,7 +2,7 @@ from preprocess import preprocess_puzzle_image, save_pieces
 
 
 def main():
-    image_path = "starry_night_rotate.png"
+    image_path = "examples/starry_night_rotate.png"
 
     # 2. preprocess
     # --- 修复：这里需要用两个变量接收返回值 (pieces 和 config) ---
