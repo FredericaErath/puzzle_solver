@@ -13,26 +13,26 @@ Updates:
 from __future__ import annotations
 
 import argparse
+import copy
 import heapq
-import cv2
-import numpy as np
+import math
 import os
 import shutil
-import math
-import time
-import copy
-from dataclasses import dataclass, field
-from typing import List, Tuple, Optional, Dict, Set
 import sys
+import time
 import traceback
+from dataclasses import dataclass, field
+
+import cv2
+import numpy as np
 
 sys.setrecursionlimit(10000)
 
-from preprocess import PuzzlePiece, preprocess_puzzle_image, EdgeFeatures
+from preprocess import preprocess_puzzle_image
 
 # ---- Hyperparameters ----
 DEFAULT_TOLERANCE_MULTIPLIER = 3.0
-MIN_ABSOLUTE_THRESHOLD = 2.0
+MIN_ABSOLUTE_THRESHOLD = 8.0
 MAX_BRANCH_FACTOR = 64
 PREDICTION_WEIGHT = 0.4
 COSINE_WEIGHT = 0.5
@@ -301,7 +301,7 @@ class BacktrackingSolver:
                             # V-Match
                             other_bottom = self._get_edge_pixels(j, rj, 'bottom')
                             s_v = self._compute_statistical_similarity(my_top, other_bottom, 'vertical')
-                            if s_v < 10.0:
+                            if s_v < 15.0:
                                 heapq.heappush(candidates, (s_v, regime, (i, ri, 0, 0, j, rj, -1, 0)))
 
                             # H-Match
