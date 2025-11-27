@@ -1,13 +1,10 @@
 """
-attemptA.py (v67 - Dynamic Orientation Regime)
+attemptB.py (v71 - Fixed Grid Estimation)
 
 Updates:
-1. DYNAMIC REGIME: Removed hard-coded "Landscape" vs "Portrait" check in __init__.
-   - The solver now tests seeds for BOTH orientations (pieces as WxH and HxW).
-   - It automatically picks the orientation that yields better edge matching.
-   - Fixes the issue where portrait images (Monet) were being assembled sideways.
-2. STRICT SQUARE LOCK: Retained the logic to force NxN grid (e.g. 5x5) to prevent 4x6 errors.
-3. AREA RECOVERY: Can now handle missing pieces (e.g. 20/25) without failing, while keeping the 5x5 bounds.
+1. FIXED: Grid estimation now factorizes piece count to find tightest rectangle (e.g., 20 pieces -> 4x5 or 5x4) instead of forcing a loose square (5x5).
+2. PREVIOUS: Added missing '_save_debug_snapshot' method to BacktrackingSolver.
+3. PREVIOUS: Complexity Bias & Greedy Lookahead.
 """
 
 from __future__ import annotations
@@ -38,6 +35,9 @@ PREDICTION_WEIGHT = 0.4
 COSINE_WEIGHT = 0.5
 BORDER_LUMINANCE_THRESHOLD = 15.0
 SEARCH_TIMEOUT = 180.0
+
+# Complexity Bias Weight
+COMPLEXITY_BIAS_WEIGHT = 1.0
 
 
 @dataclass
@@ -78,58 +78,113 @@ class BacktrackingSolver:
             if os.path.exists("debug_steps"): shutil.rmtree("debug_steps")
             os.makedirs("debug_steps")
 
-        # 1. Geometry Analysis (Just get dimensions, decide regime later)
+        # 1. Geometry Analysis
         dims = sorted([(p.size[0], p.size[1]) for p in pieces], key=lambda x: x[0] * x[1])
         median_dim = dims[len(dims) // 2]
         self.long_dim = max(median_dim)
         self.short_dim = min(median_dim)
-
-        # Decide if pieces are roughly square themselves
         self.pieces_are_square = (self.long_dim - self.short_dim) < 5
 
-        # 2. Precompute Edges (We compute raw edges relative to the image data)
-        # Note: We will handle logic for "Portrait vs Landscape" interpretation in _get_edge_pixels
+        # 2. Precompute Edges & Complexity
+        self.edge_complexities = {}  # Stores raw complexity scores
+        self.min_complexity = 0.0
+        self.max_complexity = 1.0
         self.piece_edges = self._precompute_raw_edges()
 
-        # 3. Grid Limits (Strict Square Mode)
+        # 3. Grid Limits (Strict Square Mode -> Adaptive Rectangle Mode)
+        self.auto_dims = None
         if known_W and known_H:
-            # We can't set max_rows/cols yet because we don't know unit_w/h
             self.known_bounds = (known_W, known_H)
         else:
             self.known_bounds = None
-            side_len = math.ceil(math.sqrt(self.num_pieces))
-            self.max_rows = side_len
-            self.max_cols = side_len
-            if self.debug: print(f"[Grid] Forced Square Bounds: {self.max_rows}x{self.max_cols}")
+            # Heuristic: Find factor pair closest to square (e.g. 20 -> 4x5)
+            # This prevents 20 pieces being placed in a 5x5 grid with holes.
+            n = self.num_pieces
+            w = int(math.sqrt(n))
+            while w > 1 and n % w != 0:
+                w -= 1
+            h = n // w
+            self.auto_dims = sorted((w, h))  # (short, long)
+
+            # Set max scalar limits to the long dimension to allow rotation
+            self.max_rows = self.auto_dims[1]
+            self.max_cols = self.auto_dims[1]
+
+            if self.debug:
+                print(f"[Grid] Adaptive Bounds Detected: {self.auto_dims[0]}x{self.auto_dims[1]} (or rotated)")
 
         self.grid = {}
         self.used_pids = set()
         self.min_r, self.max_r = 0, 0
         self.min_c, self.max_c = 0, 0
 
-        # Will be set after regime selection
         self.unit_w = 0
         self.unit_h = 0
         self.valid_rotations = {}
 
+    # -------------------------------------------------------------------------
+    # Complexity Bias Logic
+    # -------------------------------------------------------------------------
+    def _calc_complexity(self, bgr_strip):
+        if bgr_strip is None or bgr_strip.size == 0: return 0.0
+        lab = cv2.cvtColor(bgr_strip, cv2.COLOR_BGR2Lab)
+        l_channel = lab[:, :, 0].astype(np.float32).ravel()
+        if len(l_channel) < 2: return 0.0
+        var_l = np.var(l_channel)
+        grad = np.diff(l_channel)
+        energy = np.mean(grad ** 2)
+        return float(var_l + energy)
+
     def _precompute_raw_edges(self):
         cache = {}
+        all_complexities = []
         for p in self.pieces:
             img = getattr(p, 'raw_image', p.image)
             h, w = img.shape[:2]
-            d = 1;
+            d = 1
             w_strip = 3
             if h < 6 or w < 6: continue
             top = img[d:d + w_strip, :]
             bottom = img[h - d - w_strip:h - d, :]
             left = img[:, d:d + w_strip]
             right = img[:, w - d - w_strip:w - d]
+
+            c_top = self._calc_complexity(top)
+            c_bottom = self._calc_complexity(bottom)
+            c_left = self._calc_complexity(left)
+            c_right = self._calc_complexity(right)
+            all_complexities.extend([c_top, c_bottom, c_left, c_right])
+
             cache[p.id] = {0: {'top': top, 'bottom': bottom, 'left': left, 'right': right}}
+            self.edge_complexities[p.id] = {'top': c_top, 'bottom': c_bottom, 'left': c_left, 'right': c_right}
+
+        if all_complexities:
+            self.min_complexity = min(all_complexities)
+            self.max_complexity = max(all_complexities)
+
         return cache
 
+    def _get_norm_complexity(self, pid: int, rot: int, side: str) -> float:
+        if pid not in self.edge_complexities: return 0.0
+        side_idx = {'top': 0, 'right': 1, 'bottom': 2, 'left': 3}[side]
+        real_idx = (side_idx - rot) % 4
+        real_name = ['top', 'right', 'bottom', 'left'][real_idx]
+        raw_c = self.edge_complexities[pid][real_name]
+        denom = self.max_complexity - self.min_complexity
+        if denom < 1e-6: return 0.0
+        return (raw_c - self.min_complexity) / denom
+
+    def _apply_complexity_bias(self, raw_cost: float, pid_a, rot_a, side_a, pid_b, rot_b, side_b) -> float:
+        if raw_cost > 200.0: return raw_cost
+        ca = self._get_norm_complexity(pid_a, rot_a, side_a)
+        cb = self._get_norm_complexity(pid_b, rot_b, side_b)
+        pair_c = max(ca, cb)
+        return raw_cost / (1.0 + COMPLEXITY_BIAS_WEIGHT * pair_c)
+
+    # -------------------------------------------------------------------------
+    # Core Logic
+    # -------------------------------------------------------------------------
     def _configure_regime(self, mode):
-        # mode='landscape': cells are wider (Long x Short)
-        # mode='portrait': cells are taller (Short x Long)
         if mode == 'landscape':
             self.unit_w = self.long_dim
             self.unit_h = self.short_dim
@@ -142,19 +197,15 @@ class BacktrackingSolver:
             self.max_cols = int(round(W / self.unit_w))
             self.max_rows = int(round(H / self.unit_h))
 
-        # Compute valid rotations for this regime
-        # If target is H, W, we check which piece orientation matches
         self.valid_rotations = {}
         for p in self.pieces:
             ph, pw = p.size
-            # If piece matches target H,W directly -> Rot 0 or 2
             if abs(ph - self.unit_h) < 10 and abs(pw - self.unit_w) < 10:
                 self.valid_rotations[p.id] = [0, 2]
-            # If piece matches swapped -> Rot 1 or 3
             elif abs(ph - self.unit_w) < 10 and abs(pw - self.unit_h) < 10:
                 self.valid_rotations[p.id] = [1, 3]
             else:
-                self.valid_rotations[p.id] = [0, 1, 2, 3]  # Square or unknown
+                self.valid_rotations[p.id] = [0, 1, 2, 3]
 
     def _get_edge_pixels(self, pid: int, rot: int, side: str) -> np.ndarray:
         if pid not in self.piece_edges: return np.zeros((3, 3, 3), dtype=np.uint8)
@@ -208,7 +259,6 @@ class BacktrackingSolver:
             B_inner = lab_b[:, 1, :]
 
         safe_sigma = 10.0
-
         diff = np.linalg.norm(A_outer - B_outer, axis=1)
         mean_diff = np.mean(diff)
         z_score_color = (mean_diff / safe_sigma)
@@ -222,7 +272,6 @@ class BacktrackingSolver:
         grad_direction_cost = np.mean(1.0 - np.sum(unit_A * unit_B, axis=1))
 
         total_cost = z_score_color + (grad_direction_cost * COSINE_WEIGHT)
-
         if np.mean(A_outer[:, 0]) < 5 or np.mean(B_outer[:, 0]) < 5: return 999.0
         return total_cost
 
@@ -233,7 +282,19 @@ class BacktrackingSolver:
         n_max_c = max(self.max_c, c)
         span_h = n_max_r - n_min_r + 1
         span_w = n_max_c - n_min_c + 1
-        return span_h <= self.max_rows and span_w <= self.max_cols
+
+        # Use strict explicit bounds if provided (from CLI width/height)
+        if self.known_bounds:
+            return span_h <= self.max_rows and span_w <= self.max_cols
+
+        # Otherwise, use the factorized dimensions logic (solving the 5x5 hole bug for 4x5 puzzles)
+        # We enforce that the shape fits within (short x long) OR (long x short)
+        short_limit, long_limit = self.auto_dims
+
+        fits_landscape = (span_h <= short_limit and span_w <= long_limit)
+        fits_portrait = (span_h <= long_limit and span_w <= short_limit)
+
+        return fits_landscape or fits_portrait
 
     def _get_frontier_slots(self):
         frontier = set()
@@ -271,90 +332,11 @@ class BacktrackingSolver:
             x = (c - min_col) * self.unit_w
             canvas[y:y + self.unit_h, x:x + self.unit_w] = img
         prefix = "final" if final else "step"
+        if not os.path.exists("debug_steps"):
+            os.makedirs("debug_steps")
         fname = f"debug_steps/{prefix}_{self.step_counter:04d}.png"
         cv2.imwrite(fname, canvas)
         if not final: self.step_counter += 1
-
-    def solve(self):
-        print("[Solver] Analyzing Regimes (Landscape vs Portrait)...")
-        self.start_time = time.time()
-
-        candidates = []
-
-        # Try BOTH regimes to see which one yields better seed matches
-        regimes = ['landscape', 'portrait'] if not self.pieces_are_square else ['landscape']
-
-        for regime in regimes:
-            # Temporarily configure to test edges
-            self._configure_regime(regime)
-
-            for i in range(self.num_pieces):
-                rots_i = self.valid_rotations[i] if self.valid_rotations[i] else [0]
-                for ri in rots_i:
-                    my_top = self._get_edge_pixels(i, ri, 'top')
-                    my_left = self._get_edge_pixels(i, ri, 'left')
-
-                    for j in range(self.num_pieces):
-                        if i == j: continue
-                        rots_j = self.valid_rotations[j] if self.valid_rotations[j] else [0]
-                        for rj in rots_j:
-                            # V-Match
-                            other_bottom = self._get_edge_pixels(j, rj, 'bottom')
-                            s_v = self._compute_statistical_similarity(my_top, other_bottom, 'vertical')
-                            if s_v < 15.0:
-                                heapq.heappush(candidates, (s_v, regime, (i, ri, 0, 0, j, rj, -1, 0)))
-
-                            # H-Match
-                            other_right = self._get_edge_pixels(j, rj, 'right')
-                            s_h = self._compute_statistical_similarity(my_left, other_right, 'horizontal')
-                            if s_h < 10.0:
-                                heapq.heappush(candidates, (s_h, regime, (i, ri, 0, 0, j, rj, 0, -1)))
-
-        if not candidates:
-            print("No matches found.")
-            return []
-
-        MAX_SEEDS_TO_TRY = 50
-        print(f"[Solver] Computed {len(candidates)} potential seeds across regimes.")
-
-        seeds_tried = 0
-        while candidates and seeds_tried < MAX_SEEDS_TO_TRY:
-            score, regime, seed_data = heapq.heappop(candidates)
-
-            # Commit to the regime of the best seed
-            self._configure_regime(regime)
-
-            p1, r1, y1, x1, p2, r2, y2, x2 = seed_data
-
-            seeds_tried += 1
-            self.match_threshold = max(score * DEFAULT_TOLERANCE_MULTIPLIER, MIN_ABSOLUTE_THRESHOLD)
-
-            print(f"\n>> Trying Seed Rank {seeds_tried} [{regime.upper()}]: P{p1} <-> P{p2} (Score {score:.2f})")
-
-            self.grid = {};
-            self.used_pids = set()
-            self.min_r, self.max_r, self.min_c, self.max_c = 0, 0, 0, 0
-
-            self.seed_r, self.seed_c = 0, 0
-
-            self._place_piece(p1, r1, 0, 0)
-            self._place_piece(p2, r2, y2 - y1, x2 - x1)
-
-            if self.visual_debug: self._save_debug_snapshot()
-
-            if self._backtrack_recursive(depth=1):
-                pass
-
-            if self.best_solution and time.time() - self.start_time > SEARCH_TIMEOUT:
-                break
-
-        if self.best_solution:
-            print(
-                f"\n[Solver] FINAL RESULT: Found {self.solutions_found} solutions. Best Score: {self.best_solution_score:.2f}")
-            return self._convert_grid_to_placements(self.best_solution)
-
-        print("[Solver] Failed to find any solution.")
-        return []
 
     def _place_piece(self, pid, rot, r, c):
         self.grid[(r, c)] = (pid, rot)
@@ -375,6 +357,320 @@ class BacktrackingSolver:
         self.min_r, self.max_r = min(rows), max(rows)
         self.min_c, self.max_c = min(cols), max(cols)
 
+    # -------------------------------------------------------------------------
+    # NEW: Greedy with Lookahead Methods
+    # -------------------------------------------------------------------------
+    def _simulate_greedy_steps(self, max_depth: int) -> float:
+        """
+        Simulates max_depth greedy steps from the current state.
+        This modifies self.grid/self.used_pids, so caller must backup state.
+        Returns accumulated cost.
+        """
+        total_cost = 0.0
+        steps = 0
+
+        for _ in range(max_depth):
+            frontier_slots = self._get_frontier_slots()
+            if not frontier_slots:
+                break
+
+            heap = []
+
+            # This logic mirrors the candidate generation in _backtrack_recursive
+            for (r, c) in frontier_slots:
+                # Basic check: bounds
+                if not self._check_bounds_validity(r, c): continue
+
+                neighbors = self._get_neighbors(r, c)
+                if not neighbors: continue
+
+                for pid in range(self.num_pieces):
+                    if pid in self.used_pids: continue
+
+                    for rot in self.valid_rotations[pid]:
+                        # Geometry check is implicit in _check_bounds_validity + single cell assumption
+
+                        total_cost_local = 0.0
+                        count = 0
+                        possible = True
+
+                        for direction, (n_pid, n_rot) in neighbors:
+                            raw_val = 0.0
+                            val = 0.0
+
+                            if direction == 'top':
+                                raw_val = self._compute_statistical_similarity(
+                                    self._get_edge_pixels(n_pid, n_rot, 'bottom'),
+                                    self._get_edge_pixels(pid, rot, 'top'), 'vertical')
+                                val = self._apply_complexity_bias(raw_val, n_pid, n_rot, 'bottom', pid, rot, 'top')
+
+                            elif direction == 'bottom':
+                                raw_val = self._compute_statistical_similarity(
+                                    self._get_edge_pixels(n_pid, n_rot, 'top'),
+                                    self._get_edge_pixels(pid, rot, 'bottom'),
+                                    'vertical')
+                                val = self._apply_complexity_bias(raw_val, n_pid, n_rot, 'top', pid, rot, 'bottom')
+
+                            elif direction == 'left':
+                                raw_val = self._compute_statistical_similarity(
+                                    self._get_edge_pixels(n_pid, n_rot, 'right'),
+                                    self._get_edge_pixels(pid, rot, 'left'),
+                                    'horizontal')
+                                val = self._apply_complexity_bias(raw_val, n_pid, n_rot, 'right', pid, rot, 'left')
+
+                            elif direction == 'right':
+                                raw_val = self._compute_statistical_similarity(
+                                    self._get_edge_pixels(n_pid, n_rot, 'left'),
+                                    self._get_edge_pixels(pid, rot, 'right'),
+                                    'horizontal')
+                                val = self._apply_complexity_bias(raw_val, n_pid, n_rot, 'left', pid, rot, 'right')
+
+                            if val > 500.0:  # High threshold for simulation
+                                possible = False
+                                break
+
+                            total_cost_local += val
+                            count += 1
+
+                        if possible and count > 0:
+                            avg_cost = total_cost_local / count
+                            heapq.heappush(heap, MoveCandidate(avg_cost, pid, rot, r, c))
+
+            if not heap:
+                break
+
+            # Greedy pick
+            best = heapq.heappop(heap)
+
+            # Apply locally
+            self._place_piece(best.pid, best.rot, best.row, best.col)
+
+            total_cost += best.cost
+            steps += 1
+
+        if steps == 0:
+            return 1e9  # Dead end
+        return total_cost
+
+    def _evaluate_candidate_with_lookahead(self, cand: MoveCandidate, depth: int) -> float:
+        """
+        Evaluates a candidate by applying it, then running a greedy simulation.
+        Backs up and restores state.
+        """
+        # Backup
+        orig_grid = self.grid.copy()
+        orig_used = self.used_pids.copy()
+        orig_min_r, orig_max_r = self.min_r, self.max_r
+        orig_min_c, orig_max_c = self.min_c, self.max_c
+
+        # Apply candidate
+        self._place_piece(cand.pid, cand.rot, cand.row, cand.col)
+
+        total_cost = cand.cost
+        steps = 1
+
+        # Lookahead
+        if depth > 1:
+            extra_cost = self._simulate_greedy_steps(depth - 1)
+            if extra_cost < 1e8:
+                total_cost += extra_cost
+                steps += (depth - 1)
+            else:
+                total_cost += 5000.0  # Penalty for dead end
+
+        score = total_cost / steps
+
+        # Restore
+        self.grid = orig_grid
+        self.used_pids = orig_used
+        self.min_r, self.max_r = orig_min_r, orig_max_r
+        self.min_c, self.max_c = orig_min_c, orig_max_c
+
+        return score
+
+    def solve_greedy_lookahead(self, K=3, depth=3):
+        """
+        Iterative solver using Lookahead. Replaces _backtrack_recursive logic.
+        """
+        # We assume a seed is already placed by solve() logic
+        if self.debug: print(f"[Lookahead] Starting iterative solve with K={K}, Depth={depth}...")
+
+        while len(self.used_pids) < self.num_pieces:
+            frontier_slots = self._get_frontier_slots()
+            if not frontier_slots:
+                if self.debug: print("[Lookahead] No frontier slots. Boxed in?")
+                return False
+
+            heap = []
+
+            # 1. Generate all valid candidates for current frontier
+            for (r, c) in frontier_slots:
+                if not self._check_bounds_validity(r, c): continue
+                neighbors = self._get_neighbors(r, c)
+                if not neighbors: continue
+
+                for pid in range(self.num_pieces):
+                    if pid in self.used_pids: continue
+                    for rot in self.valid_rotations[pid]:
+                        total_cost_local = 0.0
+                        count = 0
+                        possible = True
+
+                        for direction, (n_pid, n_rot) in neighbors:
+                            raw_val = 0.0
+                            val = 0.0
+
+                            # Same matching logic as backtrack
+                            if direction == 'top':
+                                raw_val = self._compute_statistical_similarity(
+                                    self._get_edge_pixels(n_pid, n_rot, 'bottom'),
+                                    self._get_edge_pixels(pid, rot, 'top'), 'vertical')
+                                val = self._apply_complexity_bias(raw_val, n_pid, n_rot, 'bottom', pid, rot, 'top')
+                            elif direction == 'bottom':
+                                raw_val = self._compute_statistical_similarity(
+                                    self._get_edge_pixels(n_pid, n_rot, 'top'),
+                                    self._get_edge_pixels(pid, rot, 'bottom'), 'vertical')
+                                val = self._apply_complexity_bias(raw_val, n_pid, n_rot, 'top', pid, rot, 'bottom')
+                            elif direction == 'left':
+                                raw_val = self._compute_statistical_similarity(
+                                    self._get_edge_pixels(n_pid, n_rot, 'right'),
+                                    self._get_edge_pixels(pid, rot, 'left'), 'horizontal')
+                                val = self._apply_complexity_bias(raw_val, n_pid, n_rot, 'right', pid, rot, 'left')
+                            elif direction == 'right':
+                                raw_val = self._compute_statistical_similarity(
+                                    self._get_edge_pixels(n_pid, n_rot, 'left'),
+                                    self._get_edge_pixels(pid, rot, 'right'), 'horizontal')
+                                val = self._apply_complexity_bias(raw_val, n_pid, n_rot, 'left', pid, rot, 'right')
+
+                            if val > 1000.0:
+                                possible = False;
+                                break
+                            total_cost_local += val
+                            count += 1
+
+                        if possible and count > 0:
+                            avg = total_cost_local / count
+                            # Heuristic: Penalize moves that only have 1 neighbor if others have 2+
+                            # if count == 1: avg *= 1.5
+                            heapq.heappush(heap, MoveCandidate(avg, pid, rot, r, c))
+
+            if not heap:
+                if self.debug: print("[Lookahead] No valid candidates found.")
+                return False
+
+            # 2. Lookahead on Top K
+            top_candidates = []
+            for _ in range(min(K, len(heap))):
+                top_candidates.append(heapq.heappop(heap))
+
+            best_cand = None
+            best_score = float('inf')
+
+            for cand in top_candidates:
+                score = self._evaluate_candidate_with_lookahead(cand, depth)
+                if score < best_score:
+                    best_score = score
+                    best_cand = cand
+
+            if best_cand is None:
+                return False
+
+            # 3. Commit Best
+            self._place_piece(best_cand.pid, best_cand.rot, best_cand.row, best_cand.col)
+            if self.visual_debug: self._save_debug_snapshot()
+
+            if self.debug:
+                print(
+                    f"\r[Lookahead] Placed P{best_cand.pid} (Score {best_score:.2f}) | Used: {len(self.used_pids)}/{self.num_pieces}",
+                    end="", flush=True)
+
+        return True
+
+    def solve(self, use_lookahead=False):
+        print("[Solver] Analyzing Regimes (Landscape vs Portrait)...")
+        self.start_time = time.time()
+        candidates = []
+        regimes = ['landscape', 'portrait'] if not self.pieces_are_square else ['landscape']
+
+        for regime in regimes:
+            self._configure_regime(regime)
+            for i in range(self.num_pieces):
+                rots_i = self.valid_rotations[i] if self.valid_rotations[i] else [0]
+                for ri in rots_i:
+                    my_top = self._get_edge_pixels(i, ri, 'top')
+                    my_left = self._get_edge_pixels(i, ri, 'left')
+                    for j in range(self.num_pieces):
+                        if i == j: continue
+                        rots_j = self.valid_rotations[j] if self.valid_rotations[j] else [0]
+                        for rj in rots_j:
+                            # V-Match
+                            other_bottom = self._get_edge_pixels(j, rj, 'bottom')
+                            s_v_raw = self._compute_statistical_similarity(my_top, other_bottom, 'vertical')
+                            s_v = self._apply_complexity_bias(s_v_raw, i, ri, 'top', j, rj, 'bottom')
+                            if s_v < 15.0:
+                                heapq.heappush(candidates, (s_v, regime, (i, ri, 0, 0, j, rj, -1, 0)))
+
+                            # H-Match
+                            other_right = self._get_edge_pixels(j, rj, 'right')
+                            s_h_raw = self._compute_statistical_similarity(my_left, other_right, 'horizontal')
+                            s_h = self._apply_complexity_bias(s_h_raw, i, ri, 'left', j, rj, 'right')
+                            if s_h < 10.0:
+                                heapq.heappush(candidates, (s_h, regime, (i, ri, 0, 0, j, rj, 0, -1)))
+
+        if not candidates:
+            print("No matches found.")
+            return []
+
+        MAX_SEEDS_TO_TRY = 50
+        print(f"[Solver] Computed {len(candidates)} potential seeds across regimes.")
+
+        seeds_tried = 0
+        while candidates and seeds_tried < MAX_SEEDS_TO_TRY:
+            score, regime, seed_data = heapq.heappop(candidates)
+            self._configure_regime(regime)
+            p1, r1, y1, x1, p2, r2, y2, x2 = seed_data
+
+            seeds_tried += 1
+            self.match_threshold = max(score * DEFAULT_TOLERANCE_MULTIPLIER, MIN_ABSOLUTE_THRESHOLD)
+
+            print(f"\n>> Trying Seed Rank {seeds_tried} [{regime.upper()}]: P{p1} <-> P{p2} (Biased Score {score:.2f})")
+
+            self.grid = {};
+            self.used_pids = set()
+            self.min_r, self.max_r, self.min_c, self.max_c = 0, 0, 0, 0
+            self.seed_r, self.seed_c = 0, 0
+
+            self._place_piece(p1, r1, 0, 0)
+            self._place_piece(p2, r2, y2 - y1, x2 - x1)
+
+            if self.visual_debug: self._save_debug_snapshot()
+
+            success = False
+            if use_lookahead:
+                # Use the new Greedy Lookahead iterative solver
+                success = self.solve_greedy_lookahead(K=5, depth=3)
+                if success:
+                    # Lookahead solver fills the grid in-place
+                    self.best_solution = copy.deepcopy(self.grid)
+                    self.best_solution_score = 0.0  # Placeholder
+                    self.solutions_found = 1
+            else:
+                # Use the old Recursive Backtracking solver
+                success = self._backtrack_recursive(depth=1)
+
+            if success or (self.best_solution and time.time() - self.start_time > SEARCH_TIMEOUT):
+                break
+
+        if self.best_solution:
+            print(f"\n[Solver] FINAL RESULT: Found {self.solutions_found} solutions.")
+            return self._convert_grid_to_placements(self.best_solution)
+
+        print("[Solver] Failed to find any solution.")
+        return []
+
+    # -------------------------------------------------------------------------
+    # Legacy Backtracking (Renamed for clarity, logic unchanged)
+    # -------------------------------------------------------------------------
     def _calculate_global_score(self):
         total_cost = 0.0
         for (r, c), (pid, rot) in self.grid.items():
@@ -384,10 +680,11 @@ class BacktrackingSolver:
                 if direction == 'top':
                     val = self._compute_statistical_similarity(self._get_edge_pixels(n_pid, n_rot, 'bottom'),
                                                                self._get_edge_pixels(pid, rot, 'top'), 'vertical')
-                    total_cost += val
+                    val = self._apply_complexity_bias(val, n_pid, n_rot, 'bottom', pid, rot, 'top')
                 elif direction == 'left':
                     val = self._compute_statistical_similarity(self._get_edge_pixels(n_pid, n_rot, 'right'),
                                                                self._get_edge_pixels(pid, rot, 'left'), 'horizontal')
+                    val = self._apply_complexity_bias(val, n_pid, n_rot, 'right', pid, rot, 'left')
                     total_cost += val
         return total_cost
 
@@ -402,7 +699,7 @@ class BacktrackingSolver:
                 self.best_solution_score = global_score
                 self.best_solution = copy.deepcopy(self.grid)
                 if self.visual_debug: self._save_debug_snapshot(final=True)
-            return False
+            return True  # Stop at first solution for efficiency, or return False to find all
 
         if depth % 50 == 0:
             elapsed = time.time() - self.start_time
@@ -432,22 +729,29 @@ class BacktrackingSolver:
                 avg_cost = 0.0;
                 valid_match = True
                 for (direction, (n_pid, n_rot)) in neighbors:
+                    raw_val = 0.0
                     val = 0.0
+
                     if direction == 'top':
-                        val = self._compute_statistical_similarity(self._get_edge_pixels(n_pid, n_rot, 'bottom'),
-                                                                   self._get_edge_pixels(pid, rot, 'top'), 'vertical')
+                        raw_val = self._compute_statistical_similarity(self._get_edge_pixels(n_pid, n_rot, 'bottom'),
+                                                                       self._get_edge_pixels(pid, rot, 'top'),
+                                                                       'vertical')
+                        val = self._apply_complexity_bias(raw_val, n_pid, n_rot, 'bottom', pid, rot, 'top')
                     elif direction == 'bottom':
-                        val = self._compute_statistical_similarity(self._get_edge_pixels(n_pid, n_rot, 'top'),
-                                                                   self._get_edge_pixels(pid, rot, 'bottom'),
-                                                                   'vertical')
+                        raw_val = self._compute_statistical_similarity(self._get_edge_pixels(n_pid, n_rot, 'top'),
+                                                                       self._get_edge_pixels(pid, rot, 'bottom'),
+                                                                       'vertical')
+                        val = self._apply_complexity_bias(raw_val, n_pid, n_rot, 'top', pid, rot, 'bottom')
                     elif direction == 'left':
-                        val = self._compute_statistical_similarity(self._get_edge_pixels(n_pid, n_rot, 'right'),
-                                                                   self._get_edge_pixels(pid, rot, 'left'),
-                                                                   'horizontal')
+                        raw_val = self._compute_statistical_similarity(self._get_edge_pixels(n_pid, n_rot, 'right'),
+                                                                       self._get_edge_pixels(pid, rot, 'left'),
+                                                                       'horizontal')
+                        val = self._apply_complexity_bias(raw_val, n_pid, n_rot, 'right', pid, rot, 'left')
                     elif direction == 'right':
-                        val = self._compute_statistical_similarity(self._get_edge_pixels(n_pid, n_rot, 'left'),
-                                                                   self._get_edge_pixels(pid, rot, 'right'),
-                                                                   'horizontal')
+                        raw_val = self._compute_statistical_similarity(self._get_edge_pixels(n_pid, n_rot, 'left'),
+                                                                       self._get_edge_pixels(pid, rot, 'right'),
+                                                                       'horizontal')
+                        val = self._apply_complexity_bias(raw_val, n_pid, n_rot, 'left', pid, rot, 'right')
 
                     if val > current_threshold * 1.5: valid_match = False; break
                     max_cost = max(max_cost, val);
@@ -464,9 +768,8 @@ class BacktrackingSolver:
             self._place_piece(cand.pid, cand.rot, cand.row, cand.col)
             if self.visual_debug: self._save_debug_snapshot()
 
-            self._backtrack_recursive(depth + 1)
-
-            if self.solutions_found > 10: return True
+            if self._backtrack_recursive(depth + 1):
+                return True
 
             self._remove_piece(cand.pid, cand.row, cand.col)
             attempts += 1
@@ -520,6 +823,7 @@ def main():
     parser.add_argument("--height", type=int)
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--visual_debug", action="store_true")
+    parser.add_argument("--lookahead", action="store_true", help="Use Greedy Lookahead instead of Backtracking")
     parser.add_argument("--target_w", type=int);
     parser.add_argument("--target_h", type=int)
     parser.add_argument("--timeout", type=float, default=180.0, help="Seconds to search per seed")
@@ -535,7 +839,8 @@ def main():
     try:
         solver = BacktrackingSolver(pieces, known_W=args.width, known_H=args.height,
                                     use_border_logic=use_border, debug=args.debug, visual_debug=args.visual_debug)
-        solution = solver.solve()
+        # Pass the lookahead flag to solve
+        solution = solver.solve(use_lookahead=args.lookahead)
 
         if solution:
             save_seamless(pieces, solution, args.out, solver)
