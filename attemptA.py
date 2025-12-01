@@ -21,11 +21,13 @@ from preprocess import PuzzlePiece, preprocess_puzzle_image, EdgeFeatures
 # ---- Hyperparameters ----
 T_SEED_COMPLEXITY = 0.25      # 过滤掉过度平滑的边（归一化后 0~1）
 SEED_BIAS = 1.0               # seed 专用的 complexity bias
-COMPLEXITY_BIAS = 1.0
+COMPLEXITY_BIAS = 1.5
 
 LOOKAHEAD_K = 5
 LOOKAHEAD_DEPTH = 3
 
+W_COLOR = 1.0
+W_GRAD = 0.1
 # ---------------------------------------------------------------------
 # Data Structures
 # ---------------------------------------------------------------------
@@ -214,37 +216,70 @@ class PriorityFrontierSolver:
 
     def _edge_complexity_from_line(self, pixels: np.ndarray, mask: np.ndarray) -> float:
         """
-        简单的边缘复杂度度量：
-          - 只看有效 mask 像素
-          - 用 L 通道的方差 + 一阶梯度能量
-          - 面部/衣服边缘等纹理丰富处复杂度会更高
+        边缘复杂度度量（方案一）：
+          local_texture = L/a/b 三通道方差 + L 通道梯度能量
+          contrast      = L 通道局部对比度（p95 - p5）
+          complexity    = local_texture * (1 + γ * contrast_norm)
+
+        直觉：
+          - 颜色/亮度变化越丰富 → 方差大
+          - 有纹理/细节 → 梯度能量大
+          - 有清晰的明暗跨度 → contrast 大
         """
         if pixels is None or mask is None:
             return 0.0
+
         L = min(len(pixels), len(mask))
-        if L < 2:
+        if L < 3:
             return 0.0
 
         pixels = pixels[:L]
         mask = mask[:L]
+
         valid = mask > 128
         if not np.any(valid):
             return 0.0
 
-        vals = pixels[valid]
-        if vals.shape[0] < 2:
+        vals = pixels[valid]  # (N, 3) in LAB
+        if vals.shape[0] < 3:
             return 0.0
 
-        Lch = vals[:, 0].astype(np.float32)  # LAB 的 L 通道
-        var_L = float(np.var(Lch))
+        # --- 多通道方差 ---
+        vals_f = vals.astype(np.float32)
+        Lch = vals_f[:, 0]
+        ach = vals_f[:, 1]
+        bch = vals_f[:, 2]
 
-        if Lch.shape[0] > 1:
+        var_L = float(np.var(Lch))
+        var_a = float(np.var(ach))
+        var_b = float(np.var(bch))
+
+        # --- L 通道梯度能量 ---
+        grad_energy = 0.0
+        if Lch.shape[0] > 2:
             grad = np.diff(Lch)
             grad_energy = float(np.mean(grad ** 2))
-        else:
-            grad_energy = 0.0
 
-        return var_L + grad_energy
+        # --- 局部对比度（L 的 95%-5% 分位差）---
+        p5 = float(np.percentile(Lch, 5))
+        p95 = float(np.percentile(Lch, 95))
+        contrast = max(0.0, p95 - p5)
+
+        # 按 0–255 缩放；如果你的 LAB L 不是 0–255，可以把 255 换成 100
+        contrast_norm = contrast / 255.0
+        contrast_norm = min(contrast_norm, 1.0)
+
+        # --- 综合复杂度 ---
+        # 可调权重：梯度和对比度的影响力
+        LAMBDA_GRAD = 1.0
+        GAMMA_CONTRAST = 1.0
+
+        local_texture = (var_L + var_a + var_b) + LAMBDA_GRAD * grad_energy
+        if local_texture < 1e-6:
+            return 0.0
+
+        complexity = local_texture * (1.0 + GAMMA_CONTRAST * contrast_norm)
+        return float(complexity)
 
 
     def _precompute_variants(self):
@@ -430,8 +465,8 @@ class PriorityFrontierSolver:
 
         # ---------- 综合 cost ----------
         # color_mse 是平方误差，grad_cost 是无量纲方向差，给梯度一个较小权重
-        w_color = 1.0
-        w_grad = 0.1
+        w_color = W_COLOR
+        w_grad = W_GRAD
 
         combined = w_color * color_mse + w_grad * grad_cost
 
