@@ -19,15 +19,17 @@ import numpy as np
 from preprocess import PuzzlePiece, preprocess_puzzle_image, EdgeFeatures
 
 # ---- Hyperparameters ----
-T_SEED_COMPLEXITY = 0.25      # 过滤掉过度平滑的边（归一化后 0~1）
-SEED_BIAS = 1.0               # seed 专用的 complexity bias
+T_SEED_COMPLEXITY = 0.05  # 过滤掉过度平滑的边（归一化后 0~1）
+SEED_BIAS = 1.0  # seed 专用的 complexity bias
 COMPLEXITY_BIAS = 1.0
 
 LOOKAHEAD_K = 5
 LOOKAHEAD_DEPTH = 3
 
 W_COLOR = 1.0
-W_GRAD = 2.5
+W_GRAD = 0.1
+
+
 # ---------------------------------------------------------------------
 # Data Structures
 # ---------------------------------------------------------------------
@@ -54,7 +56,6 @@ class PieceInstance:
     edge_complexity: Dict[str, float]
 
 
-
 @dataclass(order=True)
 class MoveCandidate:
     cost: float
@@ -65,12 +66,13 @@ class MoveCandidate:
 
 
 class PriorityFrontierSolver:
-    def __init__(self, pieces, W, H, config, debug, image_debug=False, debug_dir=None):
+    def __init__(self, pieces, W, H, weights, config, debug, image_debug=False, debug_dir=None):
         self.pieces = pieces
         self.num_pieces = len(pieces)
         self.W = W
         self.H = H
         self.debug = debug
+        self.weights = weights
         self.image_debug = image_debug
         self.debug_dir = debug_dir
         self.blur_edges = config.get('blur', False)
@@ -129,7 +131,6 @@ class PriorityFrontierSolver:
         self.max_cols = int(round(W / self.unit_w))
         self.max_rows = int(round(H / self.unit_h))
 
-
         if self.max_rows * self.max_cols < self.num_pieces:
             side = int(np.ceil(np.sqrt(self.num_pieces)))
             self.max_cols = side
@@ -160,7 +161,6 @@ class PriorityFrontierSolver:
         self.min_r, self.max_r = 0, 0
         self.min_c, self.max_c = 0, 0
 
-
     # ---------------- Edge Feature Rotation Helpers -----------------
 
     def _flip_edge_features(self, ef: EdgeFeatures) -> EdgeFeatures:
@@ -184,34 +184,34 @@ class PriorityFrontierSolver:
         if rot % 4 == 0:
             # 0°
             return {
-                "top":    base_edges["top"],
-                "right":  base_edges["right"],
+                "top": base_edges["top"],
+                "right": base_edges["right"],
                 "bottom": base_edges["bottom"],
-                "left":   base_edges["left"],
+                "left": base_edges["left"],
             }
         elif rot % 4 == 1:
             # 90° CW
             return {
-                "top":    self._flip_edge_features(base_edges["left"]),
-                "right":  base_edges["top"],
+                "top": self._flip_edge_features(base_edges["left"]),
+                "right": base_edges["top"],
                 "bottom": self._flip_edge_features(base_edges["right"]),
-                "left":   base_edges["bottom"],
+                "left": base_edges["bottom"],
             }
         elif rot % 4 == 2:
             # 180°
             return {
-                "top":    self._flip_edge_features(base_edges["bottom"]),
-                "right":  self._flip_edge_features(base_edges["left"]),
+                "top": self._flip_edge_features(base_edges["bottom"]),
+                "right": self._flip_edge_features(base_edges["left"]),
                 "bottom": self._flip_edge_features(base_edges["top"]),
-                "left":   self._flip_edge_features(base_edges["right"]),
+                "left": self._flip_edge_features(base_edges["right"]),
             }
         else:
             # 270° CW (90° CCW)
             return {
-                "top":    base_edges["right"],
-                "right":  self._flip_edge_features(base_edges["bottom"]),
+                "top": base_edges["right"],
+                "right": self._flip_edge_features(base_edges["bottom"]),
                 "bottom": base_edges["left"],
-                "left":   self._flip_edge_features(base_edges["top"]),
+                "left": self._flip_edge_features(base_edges["top"]),
             }
 
     def _edge_complexity_from_line(self, pixels: np.ndarray, mask: np.ndarray) -> float:
@@ -281,7 +281,6 @@ class PriorityFrontierSolver:
         complexity = local_texture * (1.0 + GAMMA_CONTRAST * contrast_norm)
         return float(complexity)
 
-
     def _precompute_variants(self):
         all_vars = []
         for p in self.pieces:
@@ -319,7 +318,8 @@ class PriorityFrontierSolver:
             all_vars.append(p_vars)
         return all_vars
 
-    def _aligned_color_mse(self, pa: np.ndarray, pb: np.ndarray, max_shift: int = 3) -> Tuple[float, Optional[np.ndarray], Optional[np.ndarray]]:
+    def _aligned_color_mse(self, pa: np.ndarray, pb: np.ndarray, max_shift: int = 3) -> Tuple[
+        float, Optional[np.ndarray], Optional[np.ndarray]]:
         """
         Level 1 + 2:
           - 在 [-max_shift, max_shift] 像素范围内做滑动对齐
@@ -367,7 +367,6 @@ class PriorityFrontierSolver:
 
         return best_mse, best_A, best_B
 
-
     def _norm_edge_complexity(self, inst: PieceInstance, side: str) -> float:
         c = float(inst.edge_complexity.get(side, 0.0))
         if self.edge_complexity_max <= self.edge_complexity_min + 1e-6:
@@ -375,12 +374,12 @@ class PriorityFrontierSolver:
         return (c - self.edge_complexity_min) / (self.edge_complexity_max - self.edge_complexity_min + 1e-6)
 
     def _apply_complexity_bias(
-        self,
-        raw_cost: float,
-        inst_a: PieceInstance,
-        side_a: str,
-        inst_b: PieceInstance,
-        side_b: str,
+            self,
+            raw_cost: float,
+            inst_a: PieceInstance,
+            side_a: str,
+            inst_b: PieceInstance,
+            side_b: str,
     ) -> float:
         """
         根据两条边的复杂度调整 cost：
@@ -395,7 +394,6 @@ class PriorityFrontierSolver:
         pair_c = max(ca, cb)
 
         return raw_cost / (1.0 + self.complexity_bias * pair_c)
-
 
     def _compute_edge_diff(self, edge_a, edge_b) -> float:
         """
@@ -422,7 +420,7 @@ class PriorityFrontierSolver:
         mask_b = mask_b[:L]
 
         # 1) 有效 mask
-        valid = (mask_a > 128) & (mask_b > 128)
+        valid = (mask_a > 250) & (mask_b > 250)
 
         # 2) near-black 过滤 (LAB 中 L 通道在索引 0)
         nb_a = pixels_a[:, 0] > 5
@@ -432,7 +430,7 @@ class PriorityFrontierSolver:
         if np.sum(valid) < 5:
             return 999999.0
 
-        pa = pixels_a[valid]   # (N,3)
+        pa = pixels_a[valid]  # (N,3)
         pb = pixels_b[valid]
 
         # 若配置了 blur_edges，可以再做一个细微的 2D blur（与原逻辑兼容）
@@ -465,14 +463,13 @@ class PriorityFrontierSolver:
 
         # ---------- 综合 cost ----------
         # color_mse 是平方误差，grad_cost 是无量纲方向差，给梯度一个较小权重
-        w_color = W_COLOR
-        w_grad = W_GRAD
+        w_color = self.weights.get('w_color', W_COLOR)
+        w_grad = self.weights.get('w_grad', W_GRAD)
 
         combined = w_color * color_mse + w_grad * grad_cost
 
         # 保持和原逻辑一致：返回 sqrt(MSE-like)
         return float(np.sqrt(combined + 1e-8))
-
 
     def _find_best_seed(self):
         """
@@ -485,7 +482,7 @@ class PriorityFrontierSolver:
         best_seed = None
 
         T_seed_complexity = T_SEED_COMPLEXITY  # 归一化后 0~1
-        seed_bias = SEED_BIAS                 # seed 专用 complexity bias
+        seed_bias = SEED_BIAS  # seed 专用 complexity bias
 
         for i in range(self.num_pieces):
             for ri in self.allowed_rots[i]:
@@ -525,8 +522,6 @@ class PriorityFrontierSolver:
                             best_seed = (v1, v2, 0, 0, v1.grid_rows, 0)
 
         return best_seed, best_score
-
-
 
     def _is_valid_geometry(self, r, c, inst):
         # 1. Overlap Check
@@ -720,7 +715,6 @@ class PriorityFrontierSolver:
 
         return score
 
-
     def _get_frontier_slots(self):
         frontier = set()
         for (r, c), inst in self.grid.items():
@@ -738,59 +732,58 @@ class PriorityFrontierSolver:
                 if (r + k, c + inst.grid_cols) not in self.grid: frontier.add((r + k, c + inst.grid_cols))
         return list(frontier)
 
-
     def _save_step_image(self, step_num: int):
         """
         保存当前 grid 状态的图像到 debug_dir，文件名为 step_000{step_num}.png
         """
         if not self.debug_dir:
             return
-        
+
         # 构建 canvas
         max_y = 0
         max_x = 0
         for (r, c), inst in self.grid.items():
             max_y = max(max_y, (r + inst.grid_rows) * self.unit_h)
             max_x = max(max_x, (c + inst.grid_cols) * self.unit_w)
-        
+
         final_H = max(self.H, max_y + 10)
         final_W = max(self.W, max_x + 10)
-        
+
         canvas = np.zeros((final_H, final_W, 4), dtype=np.uint8)
-        
+
         # 使用 _generate_final_placements 得到的 placement 信息来绘制
         processed = set()
         min_r_global = min([k[0] for k in self.grid.keys()]) if self.grid else 0
         min_c_global = min([k[1] for k in self.grid.keys()]) if self.grid else 0
-        
+
         for (r, c), inst in self.grid.items():
             if inst.pid in processed:
                 continue
-            
+
             # 检查是否为该 piece 的原点（左上角）
             is_origin = True
             if (r - 1, c) in self.grid and self.grid[(r - 1, c)] is inst:
                 is_origin = False
             if (r, c - 1) in self.grid and self.grid[(r, c - 1)] is inst:
                 is_origin = False
-            
+
             if is_origin:
                 piece = self.pieces[inst.pid]
                 img = piece.image
                 msk = piece.mask if len(piece.mask.shape) == 2 else piece.mask[:, :, 0]
-                
+
                 # 应用旋转
                 for _ in range(inst.rot):
                     img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
                     msk = cv2.rotate(msk, cv2.ROTATE_90_CLOCKWISE)
-                
+
                 # 计算在 canvas 上的位置
                 y = (r - min_r_global) * self.unit_h
                 x = (c - min_c_global) * self.unit_w
                 h, w = img.shape[:2]
                 h_eff = min(h, final_H - y)
                 w_eff = min(w, final_W - x)
-                
+
                 if h_eff > 0 and w_eff > 0:
                     b, g, r_ch = cv2.split(img[:h_eff, :w_eff])
                     patch = cv2.merge([b, g, r_ch, msk[:h_eff, :w_eff]])
@@ -798,9 +791,9 @@ class PriorityFrontierSolver:
                     valid = msk[:h_eff, :w_eff] > 128
                     roi[valid] = patch[valid]
                     canvas[y:y + h_eff, x:x + w_eff] = roi
-                
+
                 processed.add(inst.pid)
-        
+
         # 保存图像
         os.makedirs(self.debug_dir, exist_ok=True)
         filename = os.path.join(self.debug_dir, f"step_{step_num:04d}.png")
@@ -808,7 +801,7 @@ class PriorityFrontierSolver:
         cv2.imwrite(filename, canvas_bgr)
         if self.debug:
             print(f"[Debug Step] Saved {filename}")
-    
+
     def _generate_final_placements(self):
         placements = []
         processed = set()
@@ -951,21 +944,49 @@ class PriorityFrontierSolver:
         return self._generate_final_placements()
 
 
-
 # ---------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------
 
 def auto_tune_and_solve(pieces, W, H, args_out, pre_config, image_debug=False, debug_dir=None):
-    print("\n[Solver v27] Priority Frontier Strategy...")
-    p_type = pre_config.get('type', 'standard_rect')
-    config = {'blur': False}
-    if p_type == 'rotated_rect': config['blur'] = True
+    print("\n[Solver v29] Adaptive Strategy...")
 
-    solver = PriorityFrontierSolver(pieces, W, H, config, debug=True, image_debug=image_debug, debug_dir=debug_dir)
+    # 1. 检查拼图类型
+    # preprocess.py 会返回 'mode'。
+    # 'minAreaRect' 代表检测到了旋转 (Rotated)
+    # 'boundingRect' 代表是直切 (Straight)
+    mode = pre_config.get('mode', 'boundingRect')
+
+    # 2. 自动设置权重
+    if mode == 'minAreaRect':
+        print(f"   -> Detected ROTATED puzzles. Using TOLERANT mode (Lower Grad Weight).")
+        # 旋转拼图边缘有锯齿/噪声，必须降低梯度权重，否则会对不上
+        weights = {
+            'w_color': 1.0,
+            'w_grad': 0.5  # 降低！从 2.5 降回 0.5，容忍旋转噪声
+        }
+        # 旋转拼图通常需要模糊一点来掩盖锯齿
+        solve_config = {'blur': True}
+    else:
+        print(f"   -> Detected STRAIGHT puzzles. Using STRICT mode (High Grad Weight).")
+        # 直拼图边缘完美，使用高权重强制线条对齐 (Cafe 1, Irises)
+        weights = {
+            'w_color': 1.0,
+            'w_grad': 2.5  # 保持高权重！
+        }
+        solve_config = {'blur': False}
+
+    # 3. 传入 Solver
+    solver = PriorityFrontierSolver(
+        pieces, W, H,
+        config=solve_config,
+        weights=weights,  # 传入权重
+        debug=True,
+        image_debug=image_debug,
+        debug_dir=debug_dir
+    )
 
     sol = solver.solve_with_lookahead(K=LOOKAHEAD_K, depth=LOOKAHEAD_DEPTH)
-
 
     if sol:
         save_result(pieces, sol, W, H, args_out)
@@ -1026,11 +1047,11 @@ def main():
     pieces, config = preprocess_puzzle_image(args.image, args.width, args.height, debug=False)
     if not pieces: return
     W, H = (args.target_w, args.target_h) if args.target_w else estimate_canvas(pieces)
-    
+
     debug_dir = None
     if args.image_debug:
         debug_dir = "debug_steps"
-    
+
     auto_tune_and_solve(pieces, W, H, args.out, config, image_debug=args.image_debug, debug_dir=debug_dir)
 
 
