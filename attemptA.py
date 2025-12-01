@@ -27,7 +27,7 @@ LOOKAHEAD_K = 5
 LOOKAHEAD_DEPTH = 3
 
 W_COLOR = 1.0
-W_GRAD = 0.1
+W_GRAD = 2.5
 # ---------------------------------------------------------------------
 # Data Structures
 # ---------------------------------------------------------------------
@@ -547,7 +547,49 @@ class PriorityFrontierSolver:
         if w_span > self.max_cols: return False
 
         return True
-    
+
+    def _evaluate_neighbors(self, neighbors, cand_inst):
+        """
+        计算候选拼图与邻居的匹配代价。
+        改进点：使用 MAX(cost) 而不是 AVG(cost)。
+        只要有一条边匹配得很差，整个方案就应该被否决。
+        """
+        max_cost = 0.0
+        count = 0
+        possible = True
+
+        for direction, neighbor in neighbors:
+            # 1. 计算原始差异
+            if direction == 'top':
+                raw = self._compute_edge_diff(neighbor.edges['bottom'], cand_inst.edges['top'])
+                bias_side_n, bias_side_c = 'bottom', 'top'
+            elif direction == 'bottom':
+                raw = self._compute_edge_diff(neighbor.edges['top'], cand_inst.edges['bottom'])
+                bias_side_n, bias_side_c = 'top', 'bottom'
+            elif direction == 'left':
+                raw = self._compute_edge_diff(neighbor.edges['right'], cand_inst.edges['left'])
+                bias_side_n, bias_side_c = 'right', 'left'
+            else:  # right
+                raw = self._compute_edge_diff(neighbor.edges['left'], cand_inst.edges['right'])
+                bias_side_n, bias_side_c = 'left', 'right'
+
+            # 2. 严格过滤：如果原始差异过大，直接判死刑
+            if raw > 500000:
+                possible = False
+                break
+
+            # 3. 应用复杂度偏置 (Complexity Bias)
+            cost = self._apply_complexity_bias(raw, neighbor, bias_side_n, cand_inst, bias_side_c)
+
+            # 4. 记录最大代价
+            if cost > max_cost:
+                max_cost = cost
+            count += 1
+
+        # 如果没有邻居，代价为0
+        score = max_cost if count > 0 else 0.0
+        return score, possible
+
     def _simulate_greedy_steps(self, max_depth: int) -> float:
         """
         在当前 self.grid/self.used_pids 状态下，向前贪心模拟 max_depth 步。
@@ -795,121 +837,88 @@ class PriorityFrontierSolver:
                 ))
                 processed.add(inst.pid)
         return placements
-    
+
     def solve_with_lookahead(self, K: int = 3, depth: int = 2):
-        """
-        带有限深回溯的求解：
-          - 每一步先构建所有候选 MoveCandidate
-          - 从中取 cost 最小的前 K 个
-          - 对这 K 个分别做 depth 步 lookahead 评分
-          - 选评分最小的一个真正落子
-        K 和 depth 都不宜过大，默认 K=3, depth=2 对 N≈16 的拼图一般足够。
-        """
-        print("[PriorityFrontier] Initializing with lookahead...")
+        print("[PriorityFrontier] Initializing (MCF + MaxCost)...")
         seed, seed_cost = self._find_best_seed()
-        if not seed:
-            return None
+        if not seed: return None
 
         v1, v2, r1, c1, r2, c2 = seed
 
-        # 放置 seed 的两个 piece
-        self.grid[(r1, c1)] = v1
+        # 放置 Seed
+        self.grid[(r1, c1)] = v1;
         self.used_pids.add(v1.pid)
         self.min_r, self.max_r = r1, r1 + v1.grid_rows - 1
         self.min_c, self.max_c = c1, c1 + v1.grid_cols - 1
 
-        self.grid[(r2, c2)] = v2
+        self.grid[(r2, c2)] = v2;
         self.used_pids.add(v2.pid)
-        self.min_r = min(self.min_r, r2)
+        self.min_r = min(self.min_r, r2);
         self.max_r = max(self.max_r, r2 + v2.grid_rows - 1)
-        self.min_c = min(self.min_c, c2)
+        self.min_c = min(self.min_c, c2);
         self.max_c = max(self.max_c, c2 + v2.grid_cols - 1)
 
         if self.debug:
-            print(f"[PriorityFrontier] Seed Placed (Cost {seed_cost:.1f}).")
-            print(f"[Seed Debug] Seed pieces: P{v1.pid} and P{v2.pid}")
-        
-        # 保存 seed step (step 0)
-        if self.image_debug:
-            self._save_step_image(0)
-
+            print(f"[Seed] Placed P{v1.pid} & P{v2.pid} (Cost {seed_cost:.1f})")
+        if self.image_debug: self._save_step_image(0)
 
         step = 1
         while len(self.used_pids) < self.num_pieces:
             frontier_slots = self._get_frontier_slots()
             if not frontier_slots:
-                print("[PriorityFrontier] Dead end (Boxed in).")
+                print("[PriorityFrontier] Dead end.")
                 break
+
+            # ==================== [核心修改 A: 优先填坑] ====================
+            # 定义一个临时函数计算 (r,c) 周围有多少个已有邻居
+            def count_neighbors(pos):
+                r, c = pos
+                n = 0
+                if (r - 1, c) in self.grid: n += 1
+                if (r + 1, c) in self.grid: n += 1
+                if (r, c - 1) in self.grid: n += 1
+                if (r, c + 1) in self.grid: n += 1
+                return n
+
+            # 按邻居数量降序排列：邻居越多，约束越强，越应该先填
+            frontier_slots.sort(key=count_neighbors, reverse=True)
+
+            # 激进策略：只考虑那个邻居最多的位置（如果有多个并列最多，都考虑）
+            # 这能防止算法在容易的边缘“偷懒”，强迫它去填难填的洞
+            max_n = count_neighbors(frontier_slots[0])
+            best_slots = [loc for loc in frontier_slots if count_neighbors(loc) == max_n]
+            # ================================================================
 
             heap = []
 
-            # 和 solve 中相同的候选生成逻辑
-            for (r, c) in frontier_slots:
+            for (r, c) in best_slots:
+                # 获取邻居对象
                 neighbors = []
                 if (r - 1, c) in self.grid: neighbors.append(('top', self.grid[(r - 1, c)]))
                 if (r + 1, c) in self.grid: neighbors.append(('bottom', self.grid[(r + 1, c)]))
                 if (r, c - 1) in self.grid: neighbors.append(('left', self.grid[(r, c - 1)]))
                 if (r, c + 1) in self.grid: neighbors.append(('right', self.grid[(r, c + 1)]))
 
-                if not neighbors:
-                    continue
-
                 for pid in range(self.num_pieces):
-                    if pid in self.used_pids:
-                        continue
-
+                    if pid in self.used_pids: continue
                     for rot in self.allowed_rots[pid]:
                         cand_inst = self.variants[pid][rot]
-                        if not self._is_valid_geometry(r, c, cand_inst):
-                            continue
+                        if not self._is_valid_geometry(r, c, cand_inst): continue
 
-                        total_cost = 0.0
-                        count = 0
-                        possible = True
+                        # ==================== [核心修改 B: 调用新逻辑] ====================
+                        score, possible = self._evaluate_neighbors(neighbors, cand_inst)
 
-                        for direction, neighbor in neighbors:
-                            if direction == 'top':
-                                raw_cost = self._compute_edge_diff(neighbor.edges['bottom'], cand_inst.edges['top'])
-                                if raw_cost > 500000:
-                                    possible = False
-                                    break
-                                cost = self._apply_complexity_bias(raw_cost, neighbor, 'bottom', cand_inst, 'top')
-                            elif direction == 'bottom':
-                                raw_cost = self._compute_edge_diff(neighbor.edges['top'], cand_inst.edges['bottom'])
-                                if raw_cost > 500000:
-                                    possible = False
-                                    break
-                                cost = self._apply_complexity_bias(raw_cost, neighbor, 'top', cand_inst, 'bottom')
-                            elif direction == 'left':
-                                raw_cost = self._compute_edge_diff(neighbor.edges['right'], cand_inst.edges['left'])
-                                if raw_cost > 500000:
-                                    possible = False
-                                    break
-                                cost = self._apply_complexity_bias(raw_cost, neighbor, 'right', cand_inst, 'left')
-                            else:  # 'right'
-                                raw_cost = self._compute_edge_diff(neighbor.edges['left'], cand_inst.edges['right'])
-                                if raw_cost > 500000:
-                                    possible = False
-                                    break
-                                cost = self._apply_complexity_bias(raw_cost, neighbor, 'left', cand_inst, 'right')
-
-                            total_cost += cost
-                            count += 1
-
-
-                        if possible and count > 0:
-                            avg_cost = total_cost / count
-                            heapq.heappush(heap, MoveCandidate(avg_cost, pid, rot, r, c))
+                        if possible:
+                            # score 已经是 max_cost 了
+                            heapq.heappush(heap, MoveCandidate(score, pid, rot, r, c))
+                        # ================================================================
 
             if not heap:
                 print("[PriorityFrontier] No valid moves fit geometry.")
                 break
 
-            # 取前 K 个候选做 lookahead 评分
-            top_candidates = []
-            for _ in range(min(K, len(heap))):
-                top_candidates.append(heapq.heappop(heap))
-
+            # Lookahead 部分保持不变
+            top_candidates = [heapq.heappop(heap) for _ in range(min(K, len(heap)))]
             best_cand = None
             best_score = float('inf')
 
@@ -919,11 +928,9 @@ class PriorityFrontierSolver:
                     best_score = score
                     best_cand = cand
 
-            if best_cand is None:
-                print("[PriorityFrontier] Lookahead could not find a feasible move.")
-                break
+            if best_cand is None: break
 
-            # 真正落子
+            # 落子
             inst = self.variants[best_cand.pid][best_cand.rot]
             for i in range(inst.grid_rows):
                 for j in range(inst.grid_cols):
@@ -936,13 +943,9 @@ class PriorityFrontierSolver:
             self.max_c = max(self.max_c, best_cand.col + inst.grid_cols - 1)
 
             if self.debug:
-                print(f"   -> [Lookahead] Placed P{best_cand.pid} at ({best_cand.row},{best_cand.col}) "
-                      f"Cost {best_cand.cost:.1f}, Score {best_score:.1f}")
-            
-            # 保存当前步骤的图像
-            if self.image_debug:
-                self._save_step_image(step)
-            
+                print(
+                    f"   -> [Step {step}] Placed P{best_cand.pid} at ({best_cand.row},{best_cand.col}) Score {best_score:.1f}")
+            if self.image_debug: self._save_step_image(step)
             step += 1
 
         return self._generate_final_placements()
