@@ -613,96 +613,6 @@ class PriorityFrontierSolver:
                 if (r + k, c + inst.grid_cols) not in self.grid: frontier.add((r + k, c + inst.grid_cols))
         return list(frontier)
 
-    def solve(self):
-        print("[PriorityFrontier] Initializing...")
-        seed, seed_cost = self._find_best_seed()
-        if not seed: return None
-
-        v1, v2, r1, c1, r2, c2 = seed
-
-        self.grid[(r1, c1)] = v1
-        self.used_pids.add(v1.pid)
-        self.min_r, self.max_r = r1, r1 + v1.grid_rows - 1
-        self.min_c, self.max_c = c1, c1 + v1.grid_cols - 1
-
-        self.grid[(r2, c2)] = v2
-        self.used_pids.add(v2.pid)
-        self.min_r = min(self.min_r, r2)
-        self.max_r = max(self.max_r, r2 + v2.grid_rows - 1)
-        self.min_c = min(self.min_c, c2)
-        self.max_c = max(self.max_c, c2 + v2.grid_cols - 1)
-
-        if self.debug: print(f"[PriorityFrontier] Seed Placed (Cost {seed_cost:.1f}).")
-
-        while len(self.used_pids) < self.num_pieces:
-            frontier_slots = self._get_frontier_slots()
-            if not frontier_slots:
-                print("[PriorityFrontier] Dead end (Boxed in).")
-                break
-
-            heap = []
-
-            for (r, c) in frontier_slots:
-                neighbors = []
-                if (r - 1, c) in self.grid: neighbors.append(('top', self.grid[(r - 1, c)]))
-                if (r + 1, c) in self.grid: neighbors.append(('bottom', self.grid[(r + 1, c)]))
-                if (r, c - 1) in self.grid: neighbors.append(('left', self.grid[(r, c - 1)]))
-                if (r, c + 1) in self.grid: neighbors.append(('right', self.grid[(r, c + 1)]))
-
-                if not neighbors: continue
-
-                for pid in range(self.num_pieces):
-                    if pid in self.used_pids: continue
-
-                    for rot in range(4):
-                        cand = self.variants[pid][rot]
-                        if not self._is_valid_geometry(r, c, cand): continue
-
-                        total_cost = 0
-                        count = 0
-                        possible = True
-                        for direction, neighbor in neighbors:
-                            cost = 0
-                            if direction == 'top':
-                                cost = self._compute_edge_diff(neighbor.edges['bottom'], cand.edges['top'])
-                            elif direction == 'bottom':
-                                cost = self._compute_edge_diff(neighbor.edges['top'], cand.edges['bottom'])
-                            elif direction == 'left':
-                                cost = self._compute_edge_diff(neighbor.edges['right'], cand.edges['left'])
-                            elif direction == 'right':
-                                cost = self._compute_edge_diff(neighbor.edges['left'], cand.edges['right'])
-
-                            if cost > 500000: 
-                                possible = False
-                                break
-                            total_cost += cost
-                            count += 1
-
-                        if possible and count > 0:
-                            avg_cost = total_cost / count
-                            heapq.heappush(heap, MoveCandidate(avg_cost, pid, rot, r, c))
-
-            if not heap:
-                print("[PriorityFrontier] No valid moves fit geometry.")
-                break
-
-            best = heapq.heappop(heap)
-
-            inst = self.variants[best.pid][best.rot]
-            # Assign all cells
-            for i in range(inst.grid_rows):
-                for j in range(inst.grid_cols):
-                    self.grid[(best.row + i, best.col + j)] = inst
-
-            self.used_pids.add(best.pid)
-            self.min_r = min(self.min_r, best.row)
-            self.max_r = max(self.max_r, best.row + inst.grid_rows - 1)
-            self.min_c = min(self.min_c, best.col)
-            self.max_c = max(self.max_c, best.col + inst.grid_cols - 1)
-
-            if self.debug: print(f"   -> Placed P{best.pid} at ({best.row},{best.col}) Cost {best.cost:.1f}")
-
-        return self._generate_final_placements()
 
     def _generate_final_placements(self):
         placements = []
@@ -879,7 +789,7 @@ class PriorityFrontierSolver:
 # Main
 # ---------------------------------------------------------------------
 
-def auto_tune_and_solve(pieces, W, H, args_out, pre_config, lookahead = True):
+def auto_tune_and_solve(pieces, W, H, args_out, pre_config):
     print("\n[Solver v27] Priority Frontier Strategy...")
     p_type = pre_config.get('type', 'standard_rect')
     config = {'blur': False}
@@ -887,10 +797,8 @@ def auto_tune_and_solve(pieces, W, H, args_out, pre_config, lookahead = True):
 
     solver = PriorityFrontierSolver(pieces, W, H, config, debug=True)
 
-    if lookahead:
-        sol = solver.solve_with_lookahead(K=LOOKAHEAD_K, depth=LOOKAHEAD_DEPTH)
-    else:
-        sol = solver.solve()
+    sol = solver.solve_with_lookahead(K=LOOKAHEAD_K, depth=LOOKAHEAD_DEPTH)
+
 
     if sol:
         save_result(pieces, sol, W, H, args_out)
