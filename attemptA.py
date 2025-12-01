@@ -21,7 +21,7 @@ from preprocess import PuzzlePiece, preprocess_puzzle_image, EdgeFeatures
 # ---- Hyperparameters ----
 T_SEED_COMPLEXITY = 0.25      # 过滤掉过度平滑的边（归一化后 0~1）
 SEED_BIAS = 1.0               # seed 专用的 complexity bias
-COMPLEXITY_BIAS = 1.5
+COMPLEXITY_BIAS = 1.0
 
 LOOKAHEAD_K = 5
 LOOKAHEAD_DEPTH = 3
