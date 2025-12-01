@@ -2,7 +2,7 @@ from preprocess import preprocess_puzzle_image, save_pieces
 
 
 def main():
-    image_path = "examples/starry_night_rotate.png"
+    image_path = "test_cases/sample1/sample1_translate.png"
 
     # 2. preprocess
     # --- 修复：这里需要用两个变量接收返回值 (pieces 和 config) ---
@@ -13,7 +13,7 @@ def main():
     print(f"detect {len(pieces)} pieces in total")
 
     # 3. check each piece
-    out_dir = image_path[:-4] + "_preprocess"
+    out_dir = image_path[:-4] + "_preprocess1"
 
     # save_pieces 只接受列表，现在 pieces 已经是正确的列表了
     save_pieces(pieces, out_dir, save_meta=True)
