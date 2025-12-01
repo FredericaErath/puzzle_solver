@@ -14,6 +14,7 @@ import heapq
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict, Set
 import cv2
+import os
 import numpy as np
 from preprocess import PuzzlePiece, preprocess_puzzle_image, EdgeFeatures
 
@@ -62,12 +63,14 @@ class MoveCandidate:
 
 
 class PriorityFrontierSolver:
-    def __init__(self, pieces, W, H, config, debug):
+    def __init__(self, pieces, W, H, config, debug, image_debug=False, debug_dir=None):
         self.pieces = pieces
         self.num_pieces = len(pieces)
         self.W = W
         self.H = H
         self.debug = debug
+        self.image_debug = image_debug
+        self.debug_dir = debug_dir
         self.blur_edges = config.get('blur', False)
 
         # 1. Calculate Atomic Unit Size
@@ -614,6 +617,76 @@ class PriorityFrontierSolver:
         return list(frontier)
 
 
+    def _save_step_image(self, step_num: int):
+        """
+        保存当前 grid 状态的图像到 debug_dir，文件名为 step_000{step_num}.png
+        """
+        if not self.debug_dir:
+            return
+        
+        # 构建 canvas
+        max_y = 0
+        max_x = 0
+        for (r, c), inst in self.grid.items():
+            max_y = max(max_y, (r + inst.grid_rows) * self.unit_h)
+            max_x = max(max_x, (c + inst.grid_cols) * self.unit_w)
+        
+        final_H = max(self.H, max_y + 10)
+        final_W = max(self.W, max_x + 10)
+        
+        canvas = np.zeros((final_H, final_W, 4), dtype=np.uint8)
+        
+        # 使用 _generate_final_placements 得到的 placement 信息来绘制
+        processed = set()
+        min_r_global = min([k[0] for k in self.grid.keys()]) if self.grid else 0
+        min_c_global = min([k[1] for k in self.grid.keys()]) if self.grid else 0
+        
+        for (r, c), inst in self.grid.items():
+            if inst.pid in processed:
+                continue
+            
+            # 检查是否为该 piece 的原点（左上角）
+            is_origin = True
+            if (r - 1, c) in self.grid and self.grid[(r - 1, c)] is inst:
+                is_origin = False
+            if (r, c - 1) in self.grid and self.grid[(r, c - 1)] is inst:
+                is_origin = False
+            
+            if is_origin:
+                piece = self.pieces[inst.pid]
+                img = piece.image
+                msk = piece.mask if len(piece.mask.shape) == 2 else piece.mask[:, :, 0]
+                
+                # 应用旋转
+                for _ in range(inst.rot):
+                    img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+                    msk = cv2.rotate(msk, cv2.ROTATE_90_CLOCKWISE)
+                
+                # 计算在 canvas 上的位置
+                y = (r - min_r_global) * self.unit_h
+                x = (c - min_c_global) * self.unit_w
+                h, w = img.shape[:2]
+                h_eff = min(h, final_H - y)
+                w_eff = min(w, final_W - x)
+                
+                if h_eff > 0 and w_eff > 0:
+                    b, g, r_ch = cv2.split(img[:h_eff, :w_eff])
+                    patch = cv2.merge([b, g, r_ch, msk[:h_eff, :w_eff]])
+                    roi = canvas[y:y + h_eff, x:x + w_eff]
+                    valid = msk[:h_eff, :w_eff] > 128
+                    roi[valid] = patch[valid]
+                    canvas[y:y + h_eff, x:x + w_eff] = roi
+                
+                processed.add(inst.pid)
+        
+        # 保存图像
+        os.makedirs(self.debug_dir, exist_ok=True)
+        filename = os.path.join(self.debug_dir, f"step_{step_num:04d}.png")
+        canvas_bgr = cv2.cvtColor(canvas, cv2.COLOR_BGRA2BGR)
+        cv2.imwrite(filename, canvas_bgr)
+        if self.debug:
+            print(f"[Debug Step] Saved {filename}")
+    
     def _generate_final_placements(self):
         placements = []
         processed = set()
@@ -675,8 +748,13 @@ class PriorityFrontierSolver:
         if self.debug:
             print(f"[PriorityFrontier] Seed Placed (Cost {seed_cost:.1f}).")
             print(f"[Seed Debug] Seed pieces: P{v1.pid} and P{v2.pid}")
+        
+        # 保存 seed step (step 0)
+        if self.image_debug:
+            self._save_step_image(0)
 
 
+        step = 1
         while len(self.used_pids) < self.num_pieces:
             frontier_slots = self._get_frontier_slots()
             if not frontier_slots:
@@ -780,6 +858,12 @@ class PriorityFrontierSolver:
             if self.debug:
                 print(f"   -> [Lookahead] Placed P{best_cand.pid} at ({best_cand.row},{best_cand.col}) "
                       f"Cost {best_cand.cost:.1f}, Score {best_score:.1f}")
+            
+            # 保存当前步骤的图像
+            if self.image_debug:
+                self._save_step_image(step)
+            
+            step += 1
 
         return self._generate_final_placements()
 
@@ -789,13 +873,13 @@ class PriorityFrontierSolver:
 # Main
 # ---------------------------------------------------------------------
 
-def auto_tune_and_solve(pieces, W, H, args_out, pre_config):
+def auto_tune_and_solve(pieces, W, H, args_out, pre_config, image_debug=False, debug_dir=None):
     print("\n[Solver v27] Priority Frontier Strategy...")
     p_type = pre_config.get('type', 'standard_rect')
     config = {'blur': False}
     if p_type == 'rotated_rect': config['blur'] = True
 
-    solver = PriorityFrontierSolver(pieces, W, H, config, debug=True)
+    solver = PriorityFrontierSolver(pieces, W, H, config, debug=True, image_debug=image_debug, debug_dir=debug_dir)
 
     sol = solver.solve_with_lookahead(K=LOOKAHEAD_K, depth=LOOKAHEAD_DEPTH)
 
@@ -853,12 +937,18 @@ def main():
     parser.add_argument("--width", type=int)
     parser.add_argument("--height", type=int)
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--image_debug", action="store_true", help="Save intermediate step images to debug_steps/")
     args = parser.parse_args()
 
     pieces, config = preprocess_puzzle_image(args.image, args.width, args.height, debug=False)
     if not pieces: return
     W, H = (args.target_w, args.target_h) if args.target_w else estimate_canvas(pieces)
-    auto_tune_and_solve(pieces, W, H, args.out, config)
+    
+    debug_dir = None
+    if args.image_debug:
+        debug_dir = "debug_steps"
+    
+    auto_tune_and_solve(pieces, W, H, args.out, config, image_debug=args.image_debug, debug_dir=debug_dir)
 
 
 if __name__ == "__main__":
