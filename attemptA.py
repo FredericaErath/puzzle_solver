@@ -79,9 +79,54 @@ class PriorityFrontierSolver:
         self.unit_w = int(min(ws))
         self.unit_h = int(min(hs))
 
+        # ---- Grid 长边方向 & 每个 piece 合法 rotation ----
+        eps = 1e-3
+        # 是否真的是长方形 grid（而不是近似正方形）
+        self.rect_grid = abs(self.unit_h - self.unit_w) > eps
+        # True 表示格子竖着更长（height > width）
+        self.grid_vertical = self.unit_h > self.unit_w
+
+        # 对每个 piece 预计算允许使用的 rotations
+        self.allowed_rots: Dict[int, List[int]] = {}
+        for idx, p in enumerate(self.pieces):
+            base_h, base_w = p.size  # (rows, cols)
+            allowed: List[int] = []
+            for r in range(4):
+                # 和 _precompute_variants 一致的几何尺寸逻辑
+                if r % 2 == 0:
+                    h_rot, w_rot = base_h, base_w
+                else:
+                    h_rot, w_rot = base_w, base_h
+
+                # grid 近似正方形：不做限制，四个 rotation 都可以
+                if not self.rect_grid:
+                    allowed.append(r)
+                    continue
+
+                # piece 近似正方形：同样无所谓方向，保留
+                if abs(h_rot - w_rot) <= eps:
+                    allowed.append(r)
+                    continue
+
+                if self.grid_vertical:
+                    # 竖长格子：只留“竖长”的变体
+                    if h_rot >= w_rot:
+                        allowed.append(r)
+                else:
+                    # 横长格子：只留“横长”的变体
+                    if w_rot >= h_rot:
+                        allowed.append(r)
+
+            # 保险：万一没留下任何 rotation，就 fallback 回四个都允许
+            if not allowed:
+                allowed = [0, 1, 2, 3]
+
+            self.allowed_rots[idx] = allowed
+
         # 2. Calculate Target Grid Layout
         self.max_cols = int(round(W / self.unit_w))
         self.max_rows = int(round(H / self.unit_h))
+
 
         if self.max_rows * self.max_cols < self.num_pieces:
             side = int(np.ceil(np.sqrt(self.num_pieces)))
@@ -408,14 +453,14 @@ class PriorityFrontierSolver:
         seed_bias = SEED_BIAS                 # seed 专用 complexity bias
 
         for i in range(self.num_pieces):
-            for ri in range(4):
+            for ri in self.allowed_rots[i]:
                 v1 = self.variants[i][ri]
 
                 for j in range(self.num_pieces):
                     if i == j:
                         continue
 
-                    for rj in range(4):
+                    for rj in self.allowed_rots[j]:
                         v2 = self.variants[j][rj]
 
                         # ---------- RIGHT match ----------
@@ -499,7 +544,7 @@ class PriorityFrontierSolver:
                     if pid in self.used_pids:
                         continue
 
-                    for rot in range(4):
+                    for rot in self.allowed_rots[pid]:
                         cand = self.variants[pid][rot]
                         if not self._is_valid_geometry(r, c, cand):
                             continue
@@ -778,7 +823,7 @@ class PriorityFrontierSolver:
                     if pid in self.used_pids:
                         continue
 
-                    for rot in range(4):
+                    for rot in self.allowed_rots[pid]:
                         cand_inst = self.variants[pid][rot]
                         if not self._is_valid_geometry(r, c, cand_inst):
                             continue
