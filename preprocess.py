@@ -138,6 +138,63 @@ def analyze_raw_pieces(canvas, raw_contours):
         return {"type": "standard_rect", "mode": "rect", "shrink": 0, "desc": "Standard (Clean)"}
 
 
+def dynamic_shrink(image: np.ndarray, mask: np.ndarray, max_shrink: int = 3) -> Tuple[np.ndarray, np.ndarray, int]:
+    """
+    智能剥离边缘：如果边缘行/列看起来像是伪影（纯色、过暗、过亮），就切掉。
+    返回：(new_image, new_mask, actual_shrink_amount)
+    """
+    h, w = image.shape[:2]
+    current_shrink = 0
+
+    # 也就是即使不做 shrink，我们也默认切 1px 以防万一（除非你非常有信心）
+    # 如果你想极致保留，可以设 base_shrink = 0
+    base_shrink = 1
+
+    # 先做基础裁剪
+    if base_shrink > 0:
+        image = image[base_shrink:h - base_shrink, base_shrink:w - base_shrink]
+        mask = mask[base_shrink:h - base_shrink, base_shrink:w - base_shrink]
+        current_shrink += base_shrink
+
+    # 循环检查最外圈，最多再切 max_shrink - base_shrink 次
+    for _ in range(max_shrink - base_shrink):
+        h, w = image.shape[:2]
+        if h < 10 or w < 10: break  # 防止切没了
+
+        # 提取四条边
+        top = image[0, :, :]
+        bottom = image[h - 1, :, :]
+        left = image[:, 0, :]
+        right = image[:, w - 1, :]
+
+        # 拼接所有边缘像素
+        border_pixels = np.concatenate([top, bottom, left, right], axis=0)
+
+        # 计算边缘的特征
+        # 1. 亮度 (Lightness)
+        gray = cv2.cvtColor(border_pixels[np.newaxis, :, :], cv2.COLOR_BGR2GRAY).flatten()
+        mean_val = np.mean(gray)
+        std_val = np.std(gray)  # 标准差，衡量是否有纹理
+
+        # 判断逻辑：
+        # A. 几乎纯黑 (Scanner Black) -> mean < 20
+        # B. 几乎纯白 (Scanner White) -> mean > 235
+        # C. 几乎纯色 (Flat Artifact) -> std < 5 (没有纹理的死板线条)
+
+        is_garbage_edge = (mean_val < 25) or (mean_val > 230) or (std_val < 8.0)
+
+        if is_garbage_edge:
+            # 这是一个坏边，切掉 1px
+            image = image[1:h - 1, 1:w - 1]
+            mask = mask[1:h - 1, 1:w - 1]
+            current_shrink += 1
+        else:
+            # 边缘看起来有丰富的颜色变化（是画的一部分），停止裁剪
+            break
+
+    return image, mask, current_shrink
+
+
 def compute_edge_features(piece, mask, border=2, inner_shift: int = 2):
     """
     为每个 piece 计算四条边的特征，使用向内偏移 inner_shift 像素的 strip，
@@ -363,6 +420,61 @@ def compute_edge_lines_for_rotations(img: np.ndarray, mask: np.ndarray, inner_ma
     return edge_sets
 
 
+def dynamic_shrink(image: np.ndarray, mask: np.ndarray, base_shrink: int = 1, max_shrink: int = 3) -> Tuple[
+    np.ndarray, np.ndarray, int]:
+    """
+    智能动态去边 v1.1
+    增加 base_shrink 参数，允许对直图设置为 0。
+    """
+    h, w = image.shape[:2]
+    current_shrink = 0
+
+    # [Step 1] 基础裁剪 (Base Crop)
+    # 对于旋转图，base_shrink 通常为 1；对于直图，应为 0。
+    if base_shrink > 0:
+        if h > 2 * base_shrink and w > 2 * base_shrink:
+            image = image[base_shrink:h - base_shrink, base_shrink:w - base_shrink]
+            mask = mask[base_shrink:h - base_shrink, base_shrink:w - base_shrink]
+            current_shrink += base_shrink
+
+    # [Step 2] 循环剥离 (Peeling Onion)
+    # 即使 base_shrink=0，我们也检查一下是否有明显的黑边/白边（针对扫描不完美的直图）
+    # 但我们把 max_shrink 限制住，防止切太多
+    remaining_steps = max_shrink - current_shrink
+
+    for _ in range(remaining_steps):
+        h, w = image.shape[:2]
+        if h < 10 or w < 10: break
+
+        # 提取边缘
+        top = image[0, :, :]
+        bottom = image[h - 1, :, :]
+        left = image[:, 0, :]
+        right = image[:, w - 1, :]
+        border_pixels = np.concatenate([top, bottom, left, right], axis=0)
+
+        gray = cv2.cvtColor(border_pixels[np.newaxis, :, :], cv2.COLOR_BGR2GRAY).flatten()
+        mean_val = np.mean(gray)
+        std_val = np.std(gray)
+
+        # 判据：只有当边缘极其“假”的时候才切
+        # 1. 极暗且无纹理 (Scanner Black)
+        is_dark_artifact = (mean_val < 30) and (std_val < 10.0)
+        # 2. 极亮 (Paper White)
+        is_light_artifact = (mean_val > 235)
+        # 3. 极度平滑的线条 (Artificial Border)
+        is_flat_line = (std_val < 3.0)
+
+        if is_dark_artifact or is_light_artifact or is_flat_line:
+            image = image[1:h - 1, 1:w - 1]
+            mask = mask[1:h - 1, 1:w - 1]
+            current_shrink += 1
+        else:
+            break
+
+    return image, mask, current_shrink
+
+
 def preprocess_puzzle_image(image_path, width=None, height=None, debug=False):
     canvas = load_canvas_rgb(image_path, width, height)
     pad = 50
@@ -378,18 +490,43 @@ def preprocess_puzzle_image(image_path, width=None, height=None, debug=False):
     valid_cnts = [c for c in cnts if cv2.contourArea(c) > total_area * 0.001]
     if not valid_cnts: return [], {}
 
+    # 1. 自动检测类型
     config = analyze_raw_pieces(canvas, valid_cnts)
-    if debug: print(f"[Preprocess] Auto-Detected: {config['desc']}")
+
+    # 2. 根据类型决定策略
+    # 如果是直图 (standard_rect)，绝对不要预先切边 (base_shrink=0)
+    # 如果是旋转图 (rotated_rect)，为了抗锯齿，预先切 1px (base_shrink=1)
+    is_rotated = (config['type'] == 'rotated_rect')
+    target_base_shrink = 1 if is_rotated else 0
+
+    if debug:
+        print(f"[Preprocess] Mode: {config['type']}. Base Shrink: {target_base_shrink}")
 
     pieces = []
     for i, c in enumerate(valid_cnts):
         rect = cv2.minAreaRect(c)
         box = cv2.boxPoints(rect)
         corners = np.array(box, dtype=np.float32)
-        img, msk = warp_and_process(canvas, corners, c, mode=config['mode'], shrink_px=config['shrink'])
+
+        # 步骤A: 获取原始切片 (shrink_px=0, 交给 dynamic_shrink 处理)
+        img, msk = warp_and_process(canvas, corners, c, mode=config['mode'], shrink_px=0)
+
+        # 步骤B: 智能去边
+        # 传入我们根据 config 决定的 base_shrink
+        img, msk, applied_shrink = dynamic_shrink(img, msk, base_shrink=target_base_shrink, max_shrink=3)
+
+        if img.shape[0] < 5 or img.shape[1] < 5:
+            continue
+
+        # 步骤C: 特征计算
         edges = compute_edge_features(img, msk)
-        inner_margin = 1 if config.get("type") == "rotated_rect" else 0
-        edge_lines = compute_edge_lines_for_rotations(img, msk, inner_margin=inner_margin)
+
+        # 步骤D: 旋转边缘计算
+        # 注意：如果是直图，inner_margin 保持 0 即可，因为我们信任切边是完美的
+        # 如果是旋转图，虽然我们切了边，但为了保险起见，可以在旋转计算时稍微再缩一点点吗？
+        # 这里建议统一为 0，因为 dynamic_shrink 已经处理过了。
+        edge_lines = compute_edge_lines_for_rotations(img, msk, inner_margin=0)
+
         pieces.append(PuzzlePiece(i, img, msk, corners, img.shape[:2], edges, edge_lines))
 
     return pieces, config
