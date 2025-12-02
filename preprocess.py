@@ -115,7 +115,7 @@ def analyze_raw_pieces(canvas, raw_contours):
         h, w = temp_img.shape[:2]
         if h > 10 and w > 10:
             strips = [temp_img[0:2, :, :], temp_img[h - 2:h, :, :], temp_img[:, 0:2, :], temp_img[:, w - 2:w, :]]
-            total_px = 0;
+            total_px = 0
             black_px = 0
             for s in strips:
                 is_black = np.all(s < 10, axis=2)  # Stricter black threshold
@@ -133,7 +133,7 @@ def analyze_raw_pieces(canvas, raw_contours):
 
     # PARANOID CHECK: If even 1% is black, assume rotation artifacts and shrink.
     elif avg_black_border > 0.01:
-        return {"type": "rotated_rect", "mode": "rect", "shrink": 3, "desc": "Rotated (Shrink 3px)"}
+        return {"type": "rotated_rect", "mode": "rect", "shrink": 1, "desc": "Rotated (Shrink 3px)"}
     else:
         return {"type": "standard_rect", "mode": "rect", "shrink": 0, "desc": "Standard (Clean)"}
 
@@ -321,7 +321,7 @@ def extract_surface_edge(img, mask, side):
     return np.array(edge_pixels), np.array(edge_mask_vals, dtype=np.uint8)
 
 
-def compute_edge_lines_for_rotations(img: np.ndarray, mask: np.ndarray, inner_margin: int = 1):
+def compute_edge_lines_for_rotations(img: np.ndarray, mask: np.ndarray, inner_margin: int = 0):
     """
     [关键修复] 预计算旋转边缘。
     强制内缩采样 (inner_margin=1)，跳过 warp 产生的边缘混叠/黑边/锯齿。
@@ -329,14 +329,10 @@ def compute_edge_lines_for_rotations(img: np.ndarray, mask: np.ndarray, inner_ma
     """
     edge_sets = []
 
-    # 每次旋转前由于要重新采样，我们使用原始数据的副本
-    # 注意：为了保证旋转后的坐标一致性，我们在这里先旋转图片，再统一取 margin
-
     curr_img = img.copy()
     curr_msk = mask.copy()
 
     for _ in range(4):
-        # 转 LAB 提取特征
         img_lab = cv2.cvtColor(curr_img, cv2.COLOR_BGR2LAB).astype(np.float32)
         h, w = img_lab.shape[:2]
 
@@ -345,18 +341,22 @@ def compute_edge_lines_for_rotations(img: np.ndarray, mask: np.ndarray, inner_ma
         else:
             m = curr_msk
 
-        # 安全检查：如果图片太小，就不缩进
-        margin = inner_margin if h > 2 * inner_margin and w > 2 * inner_margin else 0
+        # 太小的话就不缩，防止越界
+        margin = inner_margin if (h > 2 * inner_margin and w > 2 * inner_margin) else 0
+
+        top_y = margin
+        bottom_y = h - 1 - margin
+        left_x = margin
+        right_x = w - 1 - margin
 
         edges = {
-            "top": (img_lab[0, :], m[0, :]),
-            "bottom": (img_lab[h - 1, :], m[h - 1, :]),
-            "left": (img_lab[:, 0], m[:, 0]),
-            "right": (img_lab[:, w - 1], m[:, w - 1]),
+            "top": (img_lab[top_y, :], m[top_y, :]),
+            "bottom": (img_lab[bottom_y, :], m[bottom_y, :]),
+            "left": (img_lab[:, left_x], m[:, left_x]),
+            "right": (img_lab[:, right_x], m[:, right_x]),
         }
         edge_sets.append(edges)
 
-        # 旋转 90 度，准备下一次提取
         curr_img = cv2.rotate(curr_img, cv2.ROTATE_90_CLOCKWISE)
         curr_msk = cv2.rotate(curr_msk, cv2.ROTATE_90_CLOCKWISE)
 
@@ -388,7 +388,8 @@ def preprocess_puzzle_image(image_path, width=None, height=None, debug=False):
         corners = np.array(box, dtype=np.float32)
         img, msk = warp_and_process(canvas, corners, c, mode=config['mode'], shrink_px=config['shrink'])
         edges = compute_edge_features(img, msk)
-        edge_lines = compute_edge_lines_for_rotations(img, msk)
+        inner_margin = 1 if config.get("type") == "rotated_rect" else 0
+        edge_lines = compute_edge_lines_for_rotations(img, msk, inner_margin=inner_margin)
         pieces.append(PuzzlePiece(i, img, msk, corners, img.shape[:2], edges, edge_lines))
 
     return pieces, config

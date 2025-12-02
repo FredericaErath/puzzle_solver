@@ -586,12 +586,6 @@ class PriorityFrontierSolver:
         return score, possible
 
     def _simulate_greedy_steps(self, max_depth: int) -> float:
-        """
-        在当前 self.grid/self.used_pids 状态下，向前贪心模拟 max_depth 步。
-        仅用于 lookahead 评分，不影响真实解（调用方负责备份/恢复状态）。
-
-        返回：这几步的累计 cost（若无法扩展则返回一个很大的代价）。
-        """
         total_cost = 0.0
         steps = 0
 
@@ -604,6 +598,7 @@ class PriorityFrontierSolver:
 
             for (r, c) in frontier_slots:
                 neighbors = []
+                # 这里的逻辑保持不变
                 if (r - 1, c) in self.grid: neighbors.append(('top', self.grid[(r - 1, c)]))
                 if (r + 1, c) in self.grid: neighbors.append(('bottom', self.grid[(r + 1, c)]))
                 if (r, c - 1) in self.grid: neighbors.append(('left', self.grid[(r, c - 1)]))
@@ -625,6 +620,7 @@ class PriorityFrontierSolver:
                         count = 0
                         possible = True
 
+                        # 1. 计算常规边缘匹配 Cost (保持原样)
                         for direction, neighbor in neighbors:
                             if direction == 'top':
                                 cost = self._compute_edge_diff(neighbor.edges['bottom'], cand.edges['top'])
@@ -635,11 +631,39 @@ class PriorityFrontierSolver:
                             else:  # 'right'
                                 cost = self._compute_edge_diff(neighbor.edges['left'], cand.edges['right'])
 
+                            # 这里的阈值如果太宽，会放入垃圾候选，建议稍微收紧，比如 200000
                             if cost > 500000:
                                 possible = False
                                 break
                             total_cost_local += cost
                             count += 1
+
+                        # 如果边缘匹配已经失败，就没必要算角点了
+                        if not possible:
+                            continue
+
+                        # ================= [NEW START] 2x2 闭环约束核心逻辑 =================
+                        # 只有当 count > 0 (确实有邻居) 时才计算
+                        if count > 0:
+                            # 1. 计算角点误差
+                            corner_diff = self._get_corner_diff(r, c, cand)
+
+                            # 2. 定义惩罚参数
+                            # LOOP_THRESHOLD: 超过这个值(LAB距离)，说明颜色肉眼可见不同
+                            LOOP_THRESHOLD = 40.0
+                            # LOOP_WEIGHT: 闭环约束的权重应该非常高，因为它比边缘更严格
+                            LOOP_WEIGHT = 20.0
+
+                            # 3. 施加惩罚
+                            if corner_diff > LOOP_THRESHOLD:
+                                # 严重不匹配：颜色完全不一样
+                                # 标记为不可能，或者加一个巨大的惩罚值
+                                possible = False
+                            else:
+                                # 线性惩罚：差异越大，Cost 越高
+                                # 这里乘以 count 是为了让它跟 edge_cost 的量级平衡（因为 edge_cost 是累加的）
+                                total_cost_local += (corner_diff * LOOP_WEIGHT) * count
+                        # ================= [NEW END] =======================================
 
                         if possible and count > 0:
                             avg_cost = total_cost_local / count
@@ -649,13 +673,14 @@ class PriorityFrontierSolver:
                 break
 
             best = heapq.heappop(heap)
+            # 后面的逻辑保持不变...
             inst = self.variants[best.pid][best.rot]
-
             for i in range(inst.grid_rows):
                 for j in range(inst.grid_cols):
                     self.grid[(best.row + i, best.col + j)] = inst
 
             self.used_pids.add(best.pid)
+            # ... 更新 min/max r/c ...
             self.min_r = min(self.min_r, best.row)
             self.max_r = max(self.max_r, best.row + inst.grid_rows - 1)
             self.min_c = min(self.min_c, best.col)
@@ -665,7 +690,7 @@ class PriorityFrontierSolver:
             steps += 1
 
         if steps == 0:
-            return 1e9  # 无法扩展，视为很差
+            return 1e9
         return total_cost
 
     def _evaluate_candidate_with_lookahead(self, cand: MoveCandidate, depth: int) -> float:
@@ -831,6 +856,67 @@ class PriorityFrontierSolver:
                 processed.add(inst.pid)
         return placements
 
+    def _get_corner_diff(self, r: int, c: int, cand_inst: PieceInstance) -> float:
+        """
+        计算 2x2 闭环中心的角点一致性误差。
+        检查位置 (r,c) 的 cand_inst 与 (r-1,c), (r,c-1), (r-1,c-1) 的中心交点颜色差异。
+        返回: 平均颜色距离 (LAB空间)。如果无法构成闭环，返回 0.0。
+        """
+        # 1. 检查是否存在 2x2 闭环结构
+        # 我们正在填 (r, c)，需要检查 TL, T, L 是否都存在
+        if not ((r - 1, c) in self.grid and
+                (r, c - 1) in self.grid and
+                (r - 1, c - 1) in self.grid):
+            return 0.0
+
+        # 2. 获取四个邻居实例
+        tl = self.grid[(r - 1, c - 1)]  # Top-Left
+        t = self.grid[(r - 1, c)]  # Top
+        l = self.grid[(r, c - 1)]  # Left
+        x = cand_inst  # Current (Candidate)
+
+        # 3. 提取交汇点的像素 (LAB颜色)
+        # 注意：这里假设 edges 存储顺序是 Top/Bottom: Left->Right, Left/Right: Top->Bottom
+        # 我们可以从 raw pixels 中提取。
+        # 必须检查 mask 是否有效，如果 mask 是黑的，说明是透明区域，跳过检查。
+
+        def get_pixel(inst, side, idx):
+            # edges[side] 是 (pixels, mask) 元组
+            pxs, msk = inst.edges[side]
+            if len(pxs) == 0: return None
+            # 处理索引 (支持负数索引)
+            if idx < 0: idx += len(pxs)
+            if idx < 0 or idx >= len(pxs): return None
+
+            # 检查 mask (有效性)
+            if msk[idx] < 128: return None
+            return pxs[idx]  # LAB color
+
+        # 获取四个角的颜色
+        # TL: 它的右下角 -> Bottom 边的最右点 [-1]
+        c_tl = get_pixel(tl, 'bottom', -1)
+        # T:  它的左下角 -> Bottom 边的最左点 [0]
+        c_t = get_pixel(t, 'bottom', 0)
+        # L:  它的右上角 -> Top 边的最右点 [-1]
+        c_l = get_pixel(l, 'top', -1)
+        # X:  它的左上角 -> Top 边的最左点 [0]
+        c_x = get_pixel(x, 'top', 0)
+
+        # 4. 计算一致性误差
+        valid_colors = [c for c in [c_tl, c_t, c_l, c_x] if c is not None]
+
+        # 如果有效点太少（比如刚好碰上缺口），不进行惩罚
+        if len(valid_colors) < 3:
+            return 0.0
+
+        # 计算这些颜色的聚合度（例如：到均值的平均距离）
+        valid_colors = np.array(valid_colors, dtype=np.float32)
+        center = np.mean(valid_colors, axis=0)
+        dists = np.linalg.norm(valid_colors - center, axis=1)
+        avg_dist = float(np.mean(dists))
+
+        return avg_dist
+
     def solve_with_lookahead(self, K: int = 3, depth: int = 2):
         print("[PriorityFrontier] Initializing (MCF + MaxCost)...")
         seed, seed_cost = self._find_best_seed()
@@ -951,30 +1037,27 @@ class PriorityFrontierSolver:
 def auto_tune_and_solve(pieces, W, H, args_out, pre_config, image_debug=False, debug_dir=None):
     print("\n[Solver v29] Adaptive Strategy...")
 
-    # 1. 检查拼图类型
-    # preprocess.py 会返回 'mode'。
-    # 'minAreaRect' 代表检测到了旋转 (Rotated)
-    # 'boundingRect' 代表是直切 (Straight)
-    mode = pre_config.get('mode', 'boundingRect')
+    # 1. 根据 preprocess 的 type 判断是否为旋转矩形
+    #   type: 'standard_rect' / 'rotated_rect' / 'irregular'
+    puzzle_type = pre_config.get("type", "standard_rect")
 
     # 2. 自动设置权重
-    if mode == 'minAreaRect':
-        print(f"   -> Detected ROTATED puzzles. Using TOLERANT mode (Lower Grad Weight).")
-        # 旋转拼图边缘有锯齿/噪声，必须降低梯度权重，否则会对不上
+    if puzzle_type == "rotated_rect":
+        print("   -> Detected ROTATED puzzles. Using TOLERANT mode (Lower Grad Weight).")
+        # 只对旋转矩形启用“宽松模式”：降低梯度 + 模糊 + 开启 complexity bias
         weights = {
-            'w_color': 1.0,
-            'w_grad': 0.5  # 降低！从 2.5 降回 0.5，容忍旋转噪声
+            "w_color": 1.0,
+            "w_grad": 0.5,
         }
-        # 旋转拼图通常需要模糊一点来掩盖锯齿
-        solve_config = {'blur': True}
+        solve_config = {"blur": True}
     else:
-        print(f"   -> Detected STRAIGHT puzzles. Using STRICT mode (High Grad Weight).")
-        # 直拼图边缘完美，使用高权重强制线条对齐 (Cafe 1, Irises)
+        print("   -> Using STRICT mode for STANDARD / IRREGULAR puzzles.")
+        # 直矩形 / 不规则保持原来的严格配置
         weights = {
-            'w_color': 1.0,
-            'w_grad': 2.5  # 保持高权重！
+            "w_color": 1.0,
+            "w_grad": 2.5,
         }
-        solve_config = {'blur': False}
+        solve_config = {"blur": False}
 
     # 3. 传入 Solver
     solver = PriorityFrontierSolver(
