@@ -9,6 +9,7 @@ Fixes:
 from __future__ import annotations
 
 import argparse
+import json
 import time
 import heapq
 from dataclasses import dataclass, field
@@ -1078,6 +1079,7 @@ def auto_tune_and_solve(pieces, W, H, args_out, pre_config, image_debug=False, d
 
 
 def save_result(pieces, solution, W, H, path):
+    # --- 1. 保持原有的画图逻辑 ---
     max_y = max(p.y + p.h for p in solution)
     max_x = max(p.x + p.w for p in solution)
     final_H = max(H, max_y + 10)
@@ -1088,25 +1090,48 @@ def save_result(pieces, solution, W, H, path):
     for p in solution:
         img = pieces[p.piece_id].image
         msk = pieces[p.piece_id].mask if len(pieces[p.piece_id].mask.shape) == 2 else pieces[p.piece_id].mask[:, :, 0]
+
+        # 执行旋转
         for _ in range(p.rotation):
             img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
             msk = cv2.rotate(msk, cv2.ROTATE_90_CLOCKWISE)
 
-        y, x = p.y, p.x
+        y, x = int(p.y), int(p.x)
         h, w = img.shape[:2]
+
+        # 边界检查
         h_eff = min(h, final_H - y)
         w_eff = min(w, final_W - x)
         if h_eff <= 0 or w_eff <= 0: continue
 
-        b, g, r = cv2.split(img[:h_eff, :w_eff])
-        patch = cv2.merge([b, g, r, msk[:h_eff, :w_eff]])
+        # 贴图
+        b, g, r_ch = cv2.split(img[:h_eff, :w_eff])
+        patch = cv2.merge([b, g, r_ch, msk[:h_eff, :w_eff]])
         roi = canvas[y:y + h_eff, x:x + w_eff]
         valid = msk[:h_eff, :w_eff] > 128
         roi[valid] = patch[valid]
         canvas[y:y + h_eff, x:x + w_eff] = roi
 
+    # 保存最终图片
     cv2.imwrite(path, cv2.cvtColor(canvas, cv2.COLOR_BGRA2BGR))
-    print(f"[Output] Saved to {path}")
+    print(f"[Output] Saved image to {path}")
+
+    # --- 2. 新增：保存步骤数据到 JSON ---
+    json_data = []
+    # 按照 solution 的顺序保存，这样动画就会按照算法放置的顺序播放
+    for i, p in enumerate(solution):
+        json_data.append({
+            "step": i,
+            "id": int(p.piece_id),
+            "r": int(p.rotation),
+            "x": int(p.x),
+            "y": int(p.y)
+        })
+
+    json_path = os.path.splitext(path)[0] + ".json"
+    with open(json_path, 'w') as f:
+        json.dump(json_data, f, indent=2)
+    print(f"[Output] Saved solution data to {json_path}")
 
 
 def estimate_canvas(pieces):
