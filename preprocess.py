@@ -133,7 +133,7 @@ def analyze_raw_pieces(canvas, raw_contours):
 
     # PARANOID CHECK: If even 1% is black, assume rotation artifacts and shrink.
     elif avg_black_border > 0.01:
-        return {"type": "rotated_rect", "mode": "rect", "shrink": 1, "desc": "Rotated (Shrink 3px)"}
+        return {"type": "rotated_rect", "mode": "rect", "shrink": 1, "desc": "Rotated (Shrink 1px)"}
     else:
         return {"type": "standard_rect", "mode": "rect", "shrink": 0, "desc": "Standard (Clean)"}
 
@@ -545,6 +545,75 @@ def save_pieces(pieces, out_dir, save_meta=True):
     if save_meta:
         with open(os.path.join(out_dir, "pieces_meta.json"), "w") as f:
             json.dump(meta, f, indent=2)
+
+
+
+import numpy as np
+
+def is_regular_grid(pieces, tol_ratio: float = 0.05, min_piece_size: int = 5) -> bool:
+    """
+    判断当前 puzzle 是否为「规则 grid」：
+    - 所有拼图块在「忽略旋转」的情况下，长宽基本一致。
+    - 忽略旋转的做法：对每个 piece 取 (h, w)，然后 canonical = (min(h, w), max(h, w))。
+    - 允许一定比例的浮动（tol_ratio），用于容忍 shrink / warp 误差。
+
+    参数:
+      pieces: preprocess_puzzle_image 返回的 PuzzlePiece 列表
+      tol_ratio: 尺寸允许的最大相对偏差 (max(|x - mean| / mean))
+      min_piece_size: 过滤太小的残片（防止极端噪点影响统计）
+
+    返回:
+      True  -> 认为是 regular grid（规则矩形碎片，允许旋转后 w/h 互换）
+      False -> 认为是 irregular grid（尺寸差异较大）
+    """
+    sizes = []
+
+    for p in pieces:
+        # PuzzlePiece.size 在 preprocess 里是 img.shape[:2]
+        if hasattr(p, "size") and p.size is not None:
+            h, w = p.size
+        else:
+            h, w = p.image.shape[:2]
+
+        # 跳过异常小的碎片
+        if h < min_piece_size or w < min_piece_size:
+            continue
+
+        # 规一化到「忽略旋转」的尺寸
+        a, b = sorted((h, w))  # a <= b
+        sizes.append((a, b))
+
+    # 如果有效块数量很少，默认当 regular（交给后续 solver 处理）
+    if len(sizes) <= 1:
+        return True
+
+    sizes_arr = np.array(sizes, dtype=np.float32)  # (N, 2)
+    mins = sizes_arr[:, 0]
+    maxs = sizes_arr[:, 1]
+
+    mean_min = float(np.mean(mins))
+    mean_max = float(np.mean(maxs))
+
+    # 避免除零
+    if mean_min <= 0 or mean_max <= 0:
+        return False
+
+    # 计算相对偏差
+    dev_min = np.abs(mins - mean_min) / mean_min
+    dev_max = np.abs(maxs - mean_max) / mean_max
+
+    max_dev_min = float(np.max(dev_min))
+    max_dev_max = float(np.max(dev_max))
+
+    # 只要任一方向的最大相对偏差超过 tol_ratio，就认为不是规则 grid
+    is_regular = (max_dev_min <= tol_ratio) and (max_dev_max <= tol_ratio)
+
+    print(f"[GridCheck] mean_size=({mean_min:.1f}, {mean_max:.1f}), "
+          f"max_dev=({max_dev_min:.3f}, {max_dev_max:.3f}), "
+          f"regular={is_regular}")
+
+    return is_regular
+
 
 
 def main():

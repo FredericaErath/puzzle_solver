@@ -18,7 +18,7 @@ from collections import defaultdict
 import cv2
 import numpy as np
 
-from preprocess import preprocess_puzzle_image
+from preprocess import preprocess_puzzle_image, PuzzlePiece
 
 
 @dataclass
@@ -457,6 +457,68 @@ def save_result(pieces, sol, path):
     with open(path.replace('.png', '.json'), 'w') as f:
         json.dump(sol, f, indent=2)
 
+
+def solve_irregular_from_pieces(
+    raw_pieces: List[PuzzlePiece],
+    out_path: str,
+    debug: bool = False,
+) -> None:
+    """
+    Wrapper 给 solve_puzzle.py 调用：
+    - 直接使用外部 preprocess 得到的 PuzzlePiece 列表
+    - 在本文件中转换为 Piece，推断 grid 配置，调用 GlobalOptimizationSolver
+    - 最终通过 save_result 写出 PNG + 同名 JSON
+
+    参数:
+      raw_pieces : preprocess_puzzle_image 返回的 PuzzlePiece 列表
+      out_path   : 输出图片路径 (建议以 .png 结尾，这样 save_result 的 .json 替换逻辑才正常)
+      debug      : 是否打印调试信息
+    """
+    if not raw_pieces:
+        print("[Wrapper] No pieces to solve (empty list).")
+        return
+
+    # 1) 把外部的 PuzzlePiece 转成本文件使用的 Piece
+    pieces = [
+        Piece(
+            id=p.id,
+            image=p.image,
+            mask=p.mask,
+            size=p.size,
+            edge_lines=p.edge_lines,
+        )
+        for p in raw_pieces
+    ]
+
+    print(f"[Wrapper] Solving irregular grid with {len(pieces)} pieces -> {out_path}")
+
+    # 2) 推断 grid 配置
+    config = infer_grid_config(pieces, debug=debug)
+    if config is None:
+        print("[Wrapper] Could not infer grid configuration.")
+        return
+
+    nr, nc, row_heights, col_widths = config
+    if debug:
+        print(f"[Wrapper] Grid: {nr}x{nc}")
+
+    # 3) Global optimization 求解
+    solver = GlobalOptimizationSolver(
+        pieces,
+        nr,
+        nc,
+        row_heights,
+        col_widths,
+        debug=debug,
+    )
+    sol = solver.solve()
+
+    # 4) 保存结果
+    if sol and len(sol) == len(pieces):
+        save_result(pieces, sol, out_path)
+        print("[Wrapper] Done.")
+    else:
+        print("[Wrapper] No solution found or incomplete solution.")
 
 def main():
     ap = argparse.ArgumentParser()

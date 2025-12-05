@@ -1035,17 +1035,24 @@ class PriorityFrontierSolver:
 # Main
 # ---------------------------------------------------------------------
 
-def auto_tune_and_solve(pieces, W, H, args_out, pre_config, image_debug=False, debug_dir=None):
+def auto_tune_and_solve(
+    pieces,
+    W,
+    H,
+    args_out,
+    pre_config,
+    image_debug: bool = False,
+    debug_dir: Optional[str] = None,
+    debug: bool = False,
+):
     print("\n[Solver v29] Adaptive Strategy...")
 
     # 1. 根据 preprocess 的 type 判断是否为旋转矩形
-    #   type: 'standard_rect' / 'rotated_rect' / 'irregular'
     puzzle_type = pre_config.get("type", "standard_rect")
 
     # 2. 自动设置权重
     if puzzle_type == "rotated_rect":
         print("   -> Detected ROTATED puzzles. Using TOLERANT mode (Lower Grad Weight).")
-        # 只对旋转矩形启用“宽松模式”：降低梯度 + 模糊 + 开启 complexity bias
         weights = {
             "w_color": 1.0,
             "w_grad": 0.5,
@@ -1053,7 +1060,6 @@ def auto_tune_and_solve(pieces, W, H, args_out, pre_config, image_debug=False, d
         solve_config = {"blur": True}
     else:
         print("   -> Using STRICT mode for STANDARD / IRREGULAR puzzles.")
-        # 直矩形 / 不规则保持原来的严格配置
         weights = {
             "w_color": 1.0,
             "w_grad": 2.5,
@@ -1062,12 +1068,14 @@ def auto_tune_and_solve(pieces, W, H, args_out, pre_config, image_debug=False, d
 
     # 3. 传入 Solver
     solver = PriorityFrontierSolver(
-        pieces, W, H,
+        pieces,
+        W,
+        H,
         config=solve_config,
-        weights=weights,  # 传入权重
-        debug=True,
+        weights=weights,
+        debug=debug,
         image_debug=image_debug,
-        debug_dir=debug_dir
+        debug_dir=debug_dir,
     )
 
     sol = solver.solve_with_lookahead(K=LOOKAHEAD_K, depth=LOOKAHEAD_DEPTH)
@@ -1076,6 +1084,7 @@ def auto_tune_and_solve(pieces, W, H, args_out, pre_config, image_debug=False, d
         save_result(pieces, sol, W, H, args_out)
     else:
         print("No solution found.")
+
 
 
 def save_result(pieces, solution, W, H, path):
@@ -1140,6 +1149,62 @@ def estimate_canvas(pieces):
     return s, s
 
 
+def solve_regular_from_pieces(
+    pieces: List[PuzzlePiece],
+    pre_config: Dict,
+    out_path: str,
+    target_w: Optional[int] = None,
+    target_h: Optional[int] = None,
+    debug: bool = False,
+    image_debug: bool = False,
+    debug_dir: Optional[str] = None,
+) -> None:
+    """
+    Wrapper 给 solve_puzzle.py 调用：
+    - 直接使用外部 preprocess 得到的 pieces 和 pre_config
+    - 负责估计画布大小 / 调用 auto_tune_and_solve / 保存 PNG + JSON
+
+    参数:
+      pieces     : preprocess_puzzle_image 返回的 PuzzlePiece 列表
+      pre_config : preprocess 返回的 config（包含 type / mode / shrink 等）
+      out_path   : 输出图片路径，比如 ".../image_name_solution.png"
+      target_w/h : 可选手动指定拼图画布宽高；如果都为空就自动估计
+      debug      : 是否打印详细日志
+      image_debug: 是否保存 step 图像
+      debug_dir  : step 图像输出目录（如果不指定但 image_debug=True，则默认用 out_path 同目录下的 "debug_steps"）
+    """
+    if not pieces:
+        print("[Wrapper] No pieces to solve (empty list).")
+        return
+
+    # 1. 计算目标画布大小
+    if target_w is not None and target_h is not None:
+        W, H = int(target_w), int(target_h)
+    else:
+        # 沿用原来的估计逻辑
+        W, H = estimate_canvas(pieces)
+
+    # 2. 处理 debug 目录
+    if image_debug and debug_dir is None:
+        # 默认放在输出图片所在目录的 debug_steps 子目录下
+        out_dir = os.path.dirname(os.path.abspath(out_path)) or "."
+        debug_dir = os.path.join(out_dir, "debug_steps")
+
+    print(f"[Wrapper] Solving regular grid with W={W}, H={H}, out={out_path}")
+    auto_tune_and_solve(
+        pieces,
+        W,
+        H,
+        out_path,
+        pre_config,
+        image_debug=image_debug,
+        debug_dir=debug_dir,
+        debug=debug,
+    )
+
+
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("image")
@@ -1160,8 +1225,16 @@ def main():
     if args.image_debug:
         debug_dir = "debug_steps"
 
-    auto_tune_and_solve(pieces, W, H, args.out, config, image_debug=args.image_debug, debug_dir=debug_dir)
-
+    auto_tune_and_solve(
+        pieces,
+        W,
+        H,
+        args.out,
+        config,
+        image_debug=args.image_debug,
+        debug_dir=debug_dir,
+        debug=args.debug,
+    )
 
 if __name__ == "__main__":
     main()
