@@ -54,6 +54,9 @@ debug/
 *.jpg
 *.jpeg
 
+# saved videos
+*.mp4
+
 # # But allow sample images inside `examples/`:
 # !examples/*.png
 # !examples/*.jpg
