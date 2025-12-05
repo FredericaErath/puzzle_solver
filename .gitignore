@@ -1,0 +1,76 @@
+# ------------------------------------
+# Python
+# ------------------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+
+# Build / dist
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Cache
+*.cache/
+.cache/
+.cache/*
+*.mypy_cache/
+.mypy_cache/
+
+# Logs
+*.log
+
+# ------------------------------------
+# VSCode / IDE
+# ------------------------------------
+.vscode/
+.idea/
+
+# macOS metadata
+.DS_Store
+
+# ------------------------------------
+# Project-specific
+# ------------------------------------
+
+# Output directories
+pieces_out/
+output/
+results/
+debug/
+
+# Saved images
+*.png
+*.jpg
+*.jpeg
+
+# saved videos
+*.mp4
+
+# # But allow sample images inside `examples/`:
+# !examples/*.png
+# !examples/*.jpg
+# !examples/*.jpeg
+
+# Raw .rgb input files
+*.rgb
+
+# Metadata files
+*.json
+
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
