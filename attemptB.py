@@ -1,22 +1,19 @@
 #!/usr/bin/env python3
 """
-puzzle_solver_hybrid.py - Hybrid Jigsaw Puzzle Solver
+puzzle_solver_v3.py - Improved Jigsaw Puzzle Solver with Global Optimization
 
-Combines:
-1. Size-based grid grouping (ensures square output)
-2. Edge-matching for ordering (ensures correct arrangement)
-3. Template matching (when original available)
+Key improvement: Instead of greedy ordering, try all permutations of rows/columns
+and select the one with the highest total edge matching score.
 
 Usage:
-python puzzle_solver_hybrid.py puzzle.png --out solved.png --debug
-python puzzle_solver_hybrid.py puzzle.png --original orig.png --out solved.png
+python puzzle_solver_v3.py puzzle.png --out solved.png --debug
 """
 
 import argparse
 import json
 from dataclasses import dataclass
 from typing import List, Tuple, Dict
-from itertools import combinations
+from itertools import permutations, combinations
 from collections import defaultdict
 import cv2
 import numpy as np
@@ -68,80 +65,16 @@ def edge_score(ea, eb):
     return r / (1 + np.sqrt(np.mean(np.sum(d ** 2, axis=1))) / 30)
 
 
-# ============= Template Matching =============
-
-def template_match_solve(pieces, original, debug=False):
-    total_area = sum(p.size[0] * p.size[1] for p in pieces)
-    target = int(np.sqrt(total_area))
-
-    if debug:
-        print(f"[Template] Target size: {target}x{target}")
-
-    orig_small = cv2.resize(original, (target, target))
-
-    def find_best_match(piece):
-        best = None
-        img = piece.image.copy()
-        mask = piece.mask.copy()
-
-        for rot in range(4):
-            if rot > 0:
-                img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
-                mask = cv2.rotate(mask, cv2.ROTATE_90_CLOCKWISE)
-
-            mask_bin = (mask > 128).astype(np.uint8) * 255
-            result = cv2.matchTemplate(orig_small, img, cv2.TM_CCORR_NORMED, mask=mask_bin)
-            _, max_val, _, max_loc = cv2.minMaxLoc(result)
-
-            if best is None or max_val > best[0]:
-                h, w = img.shape[:2]
-                best = (max_val, max_loc[0], max_loc[1], rot, h, w)
-
-        return best
-
-    all_matches = []
-    for p in pieces:
-        score, x, y, rot, h, w = find_best_match(p)
-        all_matches.append({
-            'id': p.id, 'rot': rot, 'x': x, 'y': y,
-            'w': w, 'h': h, 'score': score
-        })
-        if debug:
-            print(f"[Template] P{p.id}: ({x},{y}) rot={rot}, score={score:.4f}")
-
-    # Sort by score and resolve overlaps
-    all_matches = sorted(all_matches, key=lambda m: -m['score'])
-
-    def overlaps(m1, m2, tol=5):
-        return not (m1['x'] + m1['w'] <= m2['x'] + tol or
-                    m2['x'] + m2['w'] <= m1['x'] + tol or
-                    m1['y'] + m1['h'] <= m2['y'] + tol or
-                    m2['y'] + m2['h'] <= m1['y'] + tol)
-
-    final = []
-    for m in all_matches:
-        conflict = False
-        for placed in final:
-            if overlaps(m, placed):
-                conflict = True
-                break
-        if not conflict:
-            final.append(m)
-
-    return final if len(final) == len(pieces) else None
-
-
-# ============= Hybrid Grid + Edge Solver =============
-
-def cluster_heights(heights, target_rows):
-    """Cluster heights into target_rows groups using k-means"""
-    vals = sorted(heights)
-    k = target_rows
-    c = [vals[i * len(vals) // k] for i in range(k)]
+def cluster_values(vals, k):
+    """K-means clustering for 1D values"""
+    if k >= len(vals):
+        return sorted(set(vals))
+    vals_sorted = sorted(vals)
+    c = [vals_sorted[i * len(vals_sorted) // k] for i in range(k)]
 
     for _ in range(20):
         g = [[] for _ in range(k)]
-        for v in vals:
+        for v in vals_sorted:
             g[min(range(k), key=lambda i: abs(v - c[i]))].append(v)
         nc = [int(np.mean(x)) if x else c[i] for i, x in enumerate(g)]
         if nc == c:
@@ -171,9 +104,8 @@ def infer_grid_config(pieces, debug=False):
             continue
         nc = n // nr
 
-        # Cluster heights into nr groups
-        row_heights = cluster_heights(all_heights, nr)
-        col_widths = cluster_heights(all_widths, nc)
+        row_heights = cluster_values(all_heights, nr)
+        col_widths = cluster_values(all_widths, nc)
 
         sum_h = sum(row_heights)
         sum_w = sum(col_widths)
@@ -184,311 +116,310 @@ def infer_grid_config(pieces, debug=False):
         score = aspect_diff * 2 + target_diff
 
         if debug:
-            print(f"[Grid] {nr}x{nc}: h_sum={sum_h}, w_sum={sum_w}, score={score}")
+            print(f"[Grid] {nr}x{nc}: h={row_heights} (sum={sum_h}), w={col_widths} (sum={sum_w}), score={score}")
 
         if score < best_score:
             best_score = score
-            best_config = (nr, nc, row_heights)
+            best_config = (nr, nc, row_heights, col_widths)
 
     return best_config
 
 
-def hybrid_solve(pieces, debug=False):
-    """Solve using size-based grouping + edge-based ordering"""
-    n = len(pieces)
+class GlobalOptimizationSolver:
+    """
+    Solver that uses global optimization to find the best arrangement.
 
-    # Step 1: Infer grid configuration
-    config = infer_grid_config(pieces, debug)
-    if config is None:
-        if debug:
-            print("[Hybrid] Could not infer grid")
-        return None
+    Strategy:
+    1. Group pieces by size into rows
+    2. For each piece, determine its best rotation
+    3. Try all permutations of column order within each row
+    4. Try all permutations of row order
+    5. Select the arrangement with highest total edge score
+    """
 
-    nr, nc, row_heights = config
-    if debug:
-        print(f"[Hybrid] Using {nr}x{nc} grid, row_heights={row_heights}")
+    def __init__(self, pieces, nr, nc, row_heights, col_widths, debug=False):
+        self.pieces = pieces
+        self.piece_map = {p.id: p for p in pieces}
+        self.nr = nr
+        self.nc = nc
+        self.row_heights = row_heights
+        self.col_widths = col_widths
+        self.debug = debug
 
-    # Helper to get piece by id
-    piece_map = {p.id: p for p in pieces}
+        # Precompute edge scores for all piece pairs and rotations
+        self.edge_cache = self._build_edge_cache()
 
-    # Step 2: Assign pieces to rows by height
-    rows = {h: [] for h in row_heights}
-    for p in pieces:
-        best_row = min(row_heights, key=lambda rh: abs(rh - p.size[0]))
-        rows[best_row].append(p.id)
+    def _build_edge_cache(self):
+        """Precompute all edge matching scores"""
+        cache = {}
+        n = len(self.pieces)
 
-    # Verify each row has nc pieces
-    for rh, pids in rows.items():
-        if len(pids) != nc:
-            if debug:
-                print(f"[Hybrid] Row {rh} has {len(pids)} pieces, expected {nc}")
-            # This might still work, continue
-
-    # Step 3: Order pieces within each row using edge matching
-    def order_pieces(piece_ids):
-        if len(piece_ids) <= 1:
-            return piece_ids
-
-        # Compute right-left scores
-        scores = {}
-        for p1_id in piece_ids:
-            p1 = piece_map[p1_id]
-            for p2_id in piece_ids:
-                if p1_id == p2_id:
-                    continue
-                p2 = piece_map[p2_id]
-                s = edge_score(p1.edge_lines[0]['right'], p2.edge_lines[0]['left'])
-                scores[(p1_id, p2_id)] = s
-
-        # Find leftmost piece (no good left neighbor)
-        threshold = 0.4
-        left_candidates = []
-        for pid in piece_ids:
-            has_left = any(scores.get((other, pid), 0) > threshold
-                           for other in piece_ids if other != pid)
-            if not has_left:
-                left_candidates.append(pid)
-
-        # Greedy ordering
-        best_order = None
-        best_total = -1
-
-        for start in (left_candidates if left_candidates else piece_ids):
-            order = [start]
-            remaining = set(piece_ids) - {start}
-            total_score = 0
-
-            while remaining:
-                current = order[-1]
-                best_next = max(remaining, key=lambda x: scores.get((current, x), 0))
-                total_score += scores.get((current, best_next), 0)
-                order.append(best_next)
-                remaining.remove(best_next)
-
-            if total_score > best_total:
-                best_total = total_score
-                best_order = order
-
-        return best_order
-
-    ordered_rows = {}
-    for rh in row_heights:
-        ordered_rows[rh] = order_pieces(rows[rh])
-        if debug:
-            widths = [piece_map[pid].size[1] for pid in ordered_rows[rh]]
-            print(f"[Hybrid] Row {rh}: {ordered_rows[rh]}, widths={widths}")
-
-    # Step 4: Order rows using bottom-top edge matching
-    def get_row_order(ordered_rows, row_heights):
-        if len(row_heights) <= 1:
-            return row_heights
-
-        # Compute row-row scores
-        scores = {}
-        for rh1 in row_heights:
-            for rh2 in row_heights:
-                if rh1 == rh2:
-                    continue
-                total = 0
-                count = 0
-                for i, pid1 in enumerate(ordered_rows[rh1]):
-                    if i < len(ordered_rows[rh2]):
-                        pid2 = ordered_rows[rh2][i]
-                        p1 = piece_map[pid1]
-                        p2 = piece_map[pid2]
-                        s = edge_score(p1.edge_lines[0]['bottom'], p2.edge_lines[0]['top'])
-                        total += s
-                        count += 1
-                scores[(rh1, rh2)] = total / max(count, 1)
-
-        # Find top row
-        threshold = 0.4
-        top_candidates = []
-        for rh in row_heights:
-            has_top = any(scores.get((other, rh), 0) > threshold
-                          for other in row_heights if other != rh)
-            if not has_top:
-                top_candidates.append(rh)
-
-        # Greedy ordering
-        remaining = set(row_heights)
-        start = top_candidates[0] if top_candidates else row_heights[0]
-        order = [start]
-        remaining.remove(start)
-
-        while remaining:
-            current = order[-1]
-            best_next = max(remaining, key=lambda x: scores.get((current, x), 0))
-            order.append(best_next)
-            remaining.remove(best_next)
-
-        return order
-
-    row_order = get_row_order(ordered_rows, row_heights)
-    if debug:
-        print(f"[Hybrid] Row order: {row_order}")
-
-    # Step 5: Build solution
-    solution = []
-    y = 0
-    for rh in row_order:
-        x = 0
-        for pid in ordered_rows[rh]:
-            p = piece_map[pid]
-            solution.append({
-                'id': pid,
-                'rot': 0,
-                'x': x,
-                'y': y,
-                'w': p.size[1],
-                'h': p.size[0]
-            })
-            x += p.size[1]
-        y += rh
-
-    return solution
-
-
-# ============= Edge-based Assembly (fallback) =============
-
-def edge_based_assembly(pieces, debug=False):
-    n = len(pieces)
-
-    if debug:
-        print("[Edge] Computing matches...")
-
-    matches = []
-    for p1 in range(n):
-        for p2 in range(n):
-            if p1 == p2:
-                continue
+        for p1 in self.pieces:
             for r1 in range(4):
-                for r2 in range(4):
-                    rl = edge_score(pieces[p1].edge_lines[r1]['right'],
-                                    pieces[p2].edge_lines[r2]['left'])
-                    if rl > 0.3:
-                        matches.append((p1, r1, 'right', p2, r2, 'left', rl))
+                for p2 in self.pieces:
+                    if p1.id == p2.id:
+                        continue
+                    for r2 in range(4):
+                        # Right-Left score
+                        rl = edge_score(
+                            p1.edge_lines[r1]['right'],
+                            p2.edge_lines[r2]['left']
+                        )
+                        cache[(p1.id, r1, 'R', p2.id, r2)] = rl
 
-                    bt = edge_score(pieces[p1].edge_lines[r1]['bottom'],
-                                    pieces[p2].edge_lines[r2]['top'])
-                    if bt > 0.3:
-                        matches.append((p1, r1, 'bottom', p2, r2, 'top', bt))
+                        # Bottom-Top score
+                        bt = edge_score(
+                            p1.edge_lines[r1]['bottom'],
+                            p2.edge_lines[r2]['top']
+                        )
+                        cache[(p1.id, r1, 'B', p2.id, r2)] = bt
 
-    matches.sort(key=lambda x: -x[6])
+        return cache
 
-    if debug:
-        print(f"[Edge] {len(matches)} potential matches")
-        if matches:
-            print(
-                f"[Edge] Best: P{matches[0][0]}r{matches[0][1]}.{matches[0][2]} <-> P{matches[0][3]}r{matches[0][4]}.{matches[0][5]}: {matches[0][6]:.3f}")
+    def _assign_to_rows(self):
+        """Assign pieces to rows based on height"""
+        rows = {h: [] for h in self.row_heights}
 
-    if not matches:
-        return None
+        for p in self.pieces:
+            # Find best rotation and row assignment
+            best_row = None
+            best_rot = 0
+            best_diff = float('inf')
 
-    placed = {}
-    m = matches[0]
-    p1_size = get_size(pieces[m[0]], m[1])
-    placed[m[0]] = (m[1], 0, 0)
+            for rot in range(4):
+                h, w = get_size(p, rot)
+                for rh in self.row_heights:
+                    diff = abs(h - rh)
+                    if diff < best_diff:
+                        best_diff = diff
+                        best_row = rh
+                        best_rot = rot
 
-    p2_size = get_size(pieces[m[3]], m[4])
-    if m[2] == 'right':
-        placed[m[3]] = (m[4], p1_size[1], 0)
-    else:
-        placed[m[3]] = (m[4], 0, p1_size[0])
+            rows[best_row].append((p.id, best_rot))
 
-    def calc_pos(placed_info, placed_piece, placed_rot, edge, new_piece, new_rot):
-        pr, px, py = placed_info
-        ph, pw = get_size(placed_piece, placed_rot)
-        if edge == 'right':
-            return (px + pw, py)
-        elif edge == 'bottom':
-            return (px, py + ph)
-        elif edge == 'left':
-            nh, nw = get_size(new_piece, new_rot)
-            return (px - nw, py)
-        else:
-            nh, nw = get_size(new_piece, new_rot)
-            return (px, py - nh)
+        return rows
 
-    def calc_pos_inv(placed_info, placed_piece, placed_rot, edge, new_piece, new_rot):
-        pr, px, py = placed_info
-        ph, pw = get_size(placed_piece, placed_rot)
-        nh, nw = get_size(new_piece, new_rot)
-        if edge == 'left':
-            return (px - nw, py)
-        elif edge == 'top':
-            return (px, py - nh)
-        elif edge == 'right':
-            return (px + pw, py)
-        else:
-            return (px, py + ph)
+    def _get_best_rotation_for_cell(self, pid, target_h, target_w):
+        """Find the rotation that best fits the cell"""
+        p = self.piece_map[pid]
+        best_rot = 0
+        best_diff = float('inf')
 
-    def overlaps(pos, piece, rot, placed_dict, all_pieces, tol=5):
-        x, y = pos
-        h, w = get_size(piece, rot)
-        for pid, (pr, px, py) in placed_dict.items():
-            ph, pw = get_size(all_pieces[pid], pr)
-            if not (x + w <= px + tol or px + pw <= x + tol or
-                    y + h <= py + tol or py + ph <= y + tol):
-                return True
-        return False
+        for rot in range(4):
+            h, w = get_size(p, rot)
+            diff = abs(h - target_h) + abs(w - target_w)
+            if diff < best_diff:
+                best_diff = diff
+                best_rot = rot
 
-    for _ in range(n - 2):
-        best_match = None
-        best_pos = None
-        best_score = 0
+        return best_rot
 
-        for m in matches:
-            p1, r1, e1, p2, r2, e2, score = m
+    def _score_arrangement(self, grid):
+        """
+        Score a complete arrangement.
+        grid[r][c] = (pid, rot)
+        """
+        total = 0.0
 
-            if p1 in placed and p2 not in placed:
-                if placed[p1][0] != r1:
-                    continue
-                pos = calc_pos(placed[p1], pieces[p1], r1, e1, pieces[p2], r2)
-                if pos and not overlaps(pos, pieces[p2], r2, placed, pieces):
-                    if score > best_score:
-                        best_score = score
-                        best_match = (p2, r2)
-                        best_pos = pos
+        for r in range(self.nr):
+            for c in range(self.nc):
+                pid, rot = grid[r][c]
 
-            elif p2 in placed and p1 not in placed:
-                if placed[p2][0] != r2:
-                    continue
-                pos = calc_pos_inv(placed[p2], pieces[p2], r2, e2, pieces[p1], r1)
-                if pos and not overlaps(pos, pieces[p1], r1, placed, pieces):
-                    if score > best_score:
-                        best_score = score
-                        best_match = (p1, r1)
-                        best_pos = pos
+                # Right neighbor
+                if c + 1 < self.nc:
+                    npid, nrot = grid[r][c + 1]
+                    total += self.edge_cache.get((pid, rot, 'R', npid, nrot), 0)
 
-        if best_match:
-            pid, rot = best_match
-            placed[pid] = (rot, best_pos[0], best_pos[1])
-        else:
-            break
+                # Bottom neighbor
+                if r + 1 < self.nr:
+                    npid, nrot = grid[r + 1][c]
+                    total += self.edge_cache.get((pid, rot, 'B', npid, nrot), 0)
 
-    if debug:
-        print(f"[Edge] Placed {len(placed)}/{n} pieces")
+        return total
 
-    if len(placed) < n:
-        return None
+    def _try_all_column_orders(self, row_pieces):
+        """
+        Try all permutations of pieces within a row.
+        Returns list of (score, ordered_pieces) sorted by score.
+        """
+        if len(row_pieces) <= 1:
+            return [(0, row_pieces)]
 
-    min_x = min(p[1] for p in placed.values())
-    min_y = min(p[2] for p in placed.values())
+        results = []
 
-    result = []
-    for pid, (rot, x, y) in placed.items():
-        h, w = get_size(pieces[pid], rot)
-        result.append({
-            'id': pid, 'rot': rot,
-            'x': x - min_x, 'y': y - min_y,
-            'w': w, 'h': h
-        })
+        # For each permutation of the row
+        for perm in permutations(row_pieces):
+            # Calculate horizontal edge score
+            score = 0
+            for i in range(len(perm) - 1):
+                pid1, rot1 = perm[i]
+                pid2, rot2 = perm[i + 1]
+                score += self.edge_cache.get((pid1, rot1, 'R', pid2, rot2), 0)
+            results.append((score, list(perm)))
 
-    return result
+        results.sort(key=lambda x: -x[0])
+        return results
 
+    def _score_row_order(self, ordered_rows, row_order):
+        """Score a particular ordering of rows"""
+        total = 0
 
-# ============= Output =============
+        for i in range(len(row_order) - 1):
+            rh1, rh2 = row_order[i], row_order[i + 1]
+            row1 = ordered_rows[rh1]
+            row2 = ordered_rows[rh2]
+
+            # Sum vertical edge scores
+            for c in range(min(len(row1), len(row2))):
+                pid1, rot1 = row1[c]
+                pid2, rot2 = row2[c]
+                total += self.edge_cache.get((pid1, rot1, 'B', pid2, rot2), 0)
+
+        return total
+
+    def solve(self):
+        """Main solving method with global optimization"""
+
+        # Step 1: Assign pieces to rows
+        rows = self._assign_to_rows()
+
+        if self.debug:
+            print(f"[Solver] Row assignments:")
+            for rh in self.row_heights:
+                print(f"  Row h={rh}: {len(rows[rh])} pieces")
+
+        # Step 2: Find best column order for each row (try all permutations)
+        best_row_orders = {}
+        for rh in self.row_heights:
+            row_pieces = rows[rh]
+
+            # Get top N best orderings for this row
+            orderings = self._try_all_column_orders(row_pieces)
+            best_row_orders[rh] = orderings[:min(10, len(orderings))]  # Keep top 10
+
+            if self.debug:
+                best_score, best_order = orderings[0]
+                print(f"  Row h={rh}: best col score={best_score:.3f}, order={[p[0] for p in best_order]}")
+
+        # Step 3: Try all row permutations with multiple column orderings
+        best_grid = None
+        best_total_score = -1
+
+        row_perms = list(permutations(self.row_heights))
+
+        if self.debug:
+            print(f"[Solver] Trying {len(row_perms)} row permutations with multiple column orders...")
+
+        # For more thorough search, try multiple column orderings
+        # Generate all combinations of top-3 column orderings for each row
+        from itertools import product
+
+        # Get top-3 column orderings for each row
+        top_k = min(3, len(list(permutations(range(self.nc)))))
+        col_order_options = {}
+        for rh in self.row_heights:
+            col_order_options[rh] = [order for _, order in best_row_orders[rh][:top_k]]
+
+        total_combinations = 0
+        for row_perm in row_perms:
+            # Try all combinations of column orderings
+            col_options_list = [col_order_options[rh] for rh in row_perm]
+
+            for col_combo in product(*col_options_list):
+                total_combinations += 1
+
+                # Build grid
+                grid = list(col_combo)
+
+                # Score this arrangement
+                score = self._score_arrangement(grid)
+
+                if score > best_total_score:
+                    best_total_score = score
+                    best_grid = [row[:] for row in grid]
+                    best_row_order = row_perm
+
+        if self.debug:
+            print(f"[Solver] Tried {total_combinations} combinations")
+            print(f"[Solver] Best score: {best_total_score:.3f}")
+            print(f"[Solver] Best row order: {best_row_order}")
+
+        # Step 4: Try more column order combinations for the best row order
+        if best_grid is not None:
+            best_grid, best_total_score = self._refine_solution(
+                best_grid, best_row_order, best_row_orders, best_total_score
+            )
+
+        if best_grid is None:
+            return None
+
+        # Convert grid to solution format
+        return self._build_solution(best_grid, best_row_order)
+
+    def _refine_solution(self, grid, row_order, best_row_orders, current_best_score):
+        """Try more column combinations for the best row order"""
+
+        # For each row, try alternative column orderings
+        improved = True
+        iterations = 0
+        max_iterations = 50
+
+        while improved and iterations < max_iterations:
+            improved = False
+            iterations += 1
+
+            for row_idx, rh in enumerate(row_order):
+                # Try each alternative column ordering for this row
+                for _, col_order in best_row_orders[rh][1:]:
+                    # Create new grid with this column order
+                    new_grid = [row[:] for row in grid]
+                    new_grid[row_idx] = col_order
+
+                    score = self._score_arrangement(new_grid)
+
+                    if score > current_best_score:
+                        current_best_score = score
+                        grid = new_grid
+                        improved = True
+                        break
+
+                if improved:
+                    break
+
+        if self.debug and iterations > 1:
+            print(f"[Solver] Refined in {iterations} iterations, final score: {current_best_score:.3f}")
+
+        return grid, current_best_score
+
+    def _build_solution(self, grid, row_order):
+        """Convert grid to solution format"""
+        solution = []
+        y = 0
+
+        for row_idx, rh in enumerate(row_order):
+            x = 0
+            row = grid[row_idx]
+
+            for col_idx, (pid, rot) in enumerate(row):
+                p = self.piece_map[pid]
+                h, w = get_size(p, rot)
+
+                # Use actual piece size, not cell size
+                cw = self.col_widths[col_idx] if col_idx < len(self.col_widths) else w
+
+                solution.append({
+                    'id': pid,
+                    'rot': rot,
+                    'x': x,
+                    'y': y,
+                    'w': w,
+                    'h': h
+                })
+                x += w
+            y += rh
+
+        return solution
+
 
 def save_result(pieces, sol, path):
     if not sol:
@@ -499,7 +430,6 @@ def save_result(pieces, sol, path):
     mx = max(p['x'] + p['w'] for p in sol)
 
     canvas = np.zeros((my, mx, 3), dtype=np.uint8)
-
     piece_map = {p.id: p for p in pieces}
 
     for p in sol:
@@ -528,15 +458,11 @@ def save_result(pieces, sol, path):
         json.dump(sol, f, indent=2)
 
 
-# ============= Main =============
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("puzzle", help="Puzzle image with scattered pieces")
-    ap.add_argument("--original", help="Original complete image for reference")
     ap.add_argument("--out", default="solved.png")
     ap.add_argument("--debug", action="store_true")
-    ap.add_argument("--edge-only", action="store_true")
     args = ap.parse_args()
 
     print(f"[Main] Loading: {args.puzzle}")
@@ -547,45 +473,22 @@ def main():
 
     print(f"[Main] {len(pieces)} pieces")
 
-    sol = None
-
-    # Strategy 1: Template matching (if original provided)
-    if args.original and not args.edge_only:
-        print(f"[Main] Using template matching with: {args.original}")
-        original = cv2.imread(args.original)
-        if original is not None:
-            sol = template_match_solve(pieces, original, debug=args.debug)
-            if sol and len(sol) == len(pieces):
-                save_result(pieces, sol, args.out)
-                print("[Main] Done (template matching)!")
-                return 0
-
-    # Strategy 2: Edge-only mode
-    if args.edge_only:
-        print("[Main] Using edge-based assembly only")
-        sol = edge_based_assembly(pieces, debug=args.debug)
-        if sol:
-            save_result(pieces, sol, args.out)
-            print("[Main] Done (edge-based)!")
-            return 0
-        print("[Error] Edge assembly failed")
+    # Infer grid configuration
+    config = infer_grid_config(pieces, debug=args.debug)
+    if config is None:
+        print("[Error] Could not infer grid configuration")
         return 1
 
-    # Strategy 3: Hybrid (size grouping + edge ordering)
-    print("[Main] Using hybrid solver...")
-    sol = hybrid_solve(pieces, debug=args.debug)
+    nr, nc, row_heights, col_widths = config
+    print(f"[Main] Grid: {nr}x{nc}")
+
+    # Solve with global optimization
+    solver = GlobalOptimizationSolver(pieces, nr, nc, row_heights, col_widths, debug=args.debug)
+    sol = solver.solve()
 
     if sol and len(sol) == len(pieces):
         save_result(pieces, sol, args.out)
-        print("[Main] Done (hybrid)!")
-        return 0
-
-    # Strategy 4: Edge-based fallback
-    print("[Main] Falling back to edge-based assembly...")
-    sol = edge_based_assembly(pieces, debug=args.debug)
-    if sol:
-        save_result(pieces, sol, args.out)
-        print("[Main] Done (edge-based fallback)!")
+        print("[Main] Done!")
         return 0
 
     print("[Error] No solution found")
