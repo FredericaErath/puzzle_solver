@@ -426,11 +426,43 @@ def save_result(pieces, sol, path):
         print("[Error] No solution to save")
         return
 
-    my = max(p['y'] + p['h'] for p in sol)
-    mx = max(p['x'] + p['w'] for p in sol)
+    # 1. 准备 JSON 数据，严格对应 attemptA 的格式
+    # 格式: step, id, r, x, y
+    json_data = []
+    for i, p in enumerate(sol):
+        json_data.append({
+            "step": i,  # 序号
+            "id": int(p['id']),  # id
+            "r": int(p['rot']),  # rotation -> r
+            "x": int(p['x']),  # x
+            "y": int(p['y'])  # y
+        })
+
+    # 2. 导出 JSON 文件 (放在绘图之前或之后均可)
+    # 使用 rsplit 防止文件名中包含多个点导致路径错误
+    json_path = path.rsplit('.', 1)[0] + '.json'
+    with open(json_path, 'w') as f:
+        json.dump(json_data, f, indent=2)
+    print(f"[Output] Solution config saved to {json_path}")
+
+    # --- 以下是原有的绘图逻辑 (保持不变) ---
+
+    # 动态计算画布大小
+    my, mx = 0, 0
+    piece_map = {p.id: p for p in pieces}
+
+    for p in sol:
+        piece = piece_map[p['id']]
+        # 预计算旋转后的宽高
+        raw_h, raw_w = piece.image.shape[:2]
+        if p['rot'] % 2 != 0:
+            h, w = raw_w, raw_h
+        else:
+            h, w = raw_h, raw_w
+        my = max(my, p['y'] + h)
+        mx = max(mx, p['x'] + w)
 
     canvas = np.zeros((my, mx, 3), dtype=np.uint8)
-    piece_map = {p.id: p for p in pieces}
 
     for p in sol:
         piece = piece_map[p['id']]
@@ -453,10 +485,6 @@ def save_result(pieces, sol, path):
 
     cv2.imwrite(path, canvas)
     print(f"[Output] {path} ({mx}x{my})")
-
-    with open(path.replace('.png', '.json'), 'w') as f:
-        json.dump(sol, f, indent=2)
-
 
 def solve_irregular_from_pieces(
     raw_pieces: List[PuzzlePiece],
