@@ -77,6 +77,7 @@ class PriorityFrontierSolver:
         self.image_debug = image_debug
         self.debug_dir = debug_dir
         self.blur_edges = config.get('blur', False)
+        self.puzzle_type = config.get('type', 'standard_rect')
 
         # 1. Calculate Atomic Unit Size
         ws = [p.size[1] for p in pieces]
@@ -91,40 +92,49 @@ class PriorityFrontierSolver:
         # True 表示格子竖着更长（height > width）
         self.grid_vertical = self.unit_h > self.unit_w
 
+        # 对于standard_rect（translate-only），只允许rotation=0
+        self.translate_only = (self.puzzle_type == 'standard_rect')
+        if debug and self.translate_only:
+            print("[Solver] Detected translate-only puzzle, restricting rotation to 0")
+
         # 对每个 piece 预计算允许使用的 rotations
         self.allowed_rots: Dict[int, List[int]] = {}
         for idx, p in enumerate(self.pieces):
             base_h, base_w = p.size  # (rows, cols)
             allowed: List[int] = []
-            for r in range(4):
-                # 和 _precompute_variants 一致的几何尺寸逻辑
-                if r % 2 == 0:
-                    h_rot, w_rot = base_h, base_w
-                else:
-                    h_rot, w_rot = base_w, base_h
+            # 对于translate-only拼图，只允许rotation=0
+            if self.translate_only:
+                allowed = [0]
+            else:
+                for r in range(4):
+                    # 和 _precompute_variants 一致的几何尺寸逻辑
+                    if r % 2 == 0:
+                        h_rot, w_rot = base_h, base_w
+                    else:
+                        h_rot, w_rot = base_w, base_h
 
-                # grid 近似正方形：不做限制，四个 rotation 都可以
-                if not self.rect_grid:
-                    allowed.append(r)
-                    continue
-
-                # piece 近似正方形：同样无所谓方向，保留
-                if abs(h_rot - w_rot) <= eps:
-                    allowed.append(r)
-                    continue
-
-                if self.grid_vertical:
-                    # 竖长格子：只留“竖长”的变体
-                    if h_rot >= w_rot:
+                    # grid 近似正方形：不做限制，四个 rotation 都可以
+                    if not self.rect_grid:
                         allowed.append(r)
-                else:
-                    # 横长格子：只留“横长”的变体
-                    if w_rot >= h_rot:
-                        allowed.append(r)
+                        continue
 
-            # 保险：万一没留下任何 rotation，就 fallback 回四个都允许
-            if not allowed:
-                allowed = [0, 1, 2, 3]
+                    # piece 近似正方形：同样无所谓方向，保留
+                    if abs(h_rot - w_rot) <= eps:
+                        allowed.append(r)
+                        continue
+
+                    if self.grid_vertical:
+                        # 竖长格子：只留“竖长”的变体
+                        if h_rot >= w_rot:
+                            allowed.append(r)
+                    else:
+                        # 横长格子：只留“横长”的变体
+                        if w_rot >= h_rot:
+                            allowed.append(r)
+
+                # 保险：万一没留下任何 rotation，就 fallback 回四个都允许
+                if not allowed:
+                    allowed = [0, 1, 2, 3]
 
             self.allowed_rots[idx] = allowed
 
