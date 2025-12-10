@@ -132,7 +132,7 @@ def analyze_raw_pieces(canvas, raw_contours):
         return {"type": "irregular", "mode": "irregular", "shrink": 0, "desc": "Irregular (Parrot)"}
 
     # PARANOID CHECK: If even 1% is black, assume rotation artifacts and shrink.
-    elif avg_black_border > 0.01:
+    elif avg_black_border > 0.001:
         return {"type": "rotated_rect", "mode": "rect", "shrink": 1, "desc": "Rotated (Shrink 1px)"}
     else:
         return {"type": "standard_rect", "mode": "rect", "shrink": 0, "desc": "Standard (Clean)"}
