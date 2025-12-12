@@ -28,7 +28,7 @@ LOOKAHEAD_K = 5
 LOOKAHEAD_DEPTH = 3
 
 W_COLOR = 1.0
-W_GRAD = 0.1
+W_GRAD = 1.0
 
 
 # ---------------------------------------------------------------------
@@ -408,7 +408,7 @@ class PriorityFrontierSolver:
 
     def _compute_edge_diff(self, edge_a, edge_b) -> float:
         """
-        Level 1: 允许沿边缘方向 ±2 像素的滑动对齐，缓解 warp / shrink 带来的 pixel shift。
+        Level 1: 允许沿边缘方向 ±3 像素的滑动对齐，缓解 warp / shrink 带来的 pixel shift。
         Level 2: 在对齐后的子段上，对 LAB profile 做 1D Gaussian 平滑，突出低频结构。
         Level 3: 在最优对齐下，加入 L 通道梯度方向相似度 (cosine) 作为辅助项。
 
@@ -450,27 +450,29 @@ class PriorityFrontierSolver:
             pb = cv2.GaussianBlur(pb.reshape(-1, 1, 3), (1, 1), 0).reshape(-1, 3)
 
         # ---------- Level 1 + 2: 对齐 + 低频 MSE ----------
-        color_mse, best_A, best_B = self._aligned_color_mse(pa, pb, max_shift=2)
+        color_mse, best_A, best_B = self._aligned_color_mse(pa, pb, max_shift=3)
         if best_A is None or best_B is None:
             return 999999.0
 
         # ---------- Level 3: 梯度方向相似度 ----------
-        # 使用 L 通道的一阶差分，计算 cosine 距离
         LA = best_A[:, 0]
         LB = best_B[:, 0]
 
-        if len(LA) > 3 and len(LB) > 3:
-            gA = np.diff(LA)
-            gB = np.diff(LB)
+        # if len(LA) > 3 and len(LB) > 3:
+        #     gA = np.diff(LA)
+        #     gB = np.diff(LB)
 
-            # 避免全 0 梯度
-            normA = float(np.linalg.norm(gA)) + 1e-6
-            normB = float(np.linalg.norm(gB)) + 1e-6
-            cos_sim = float(np.dot(gA, gB) / (normA * normB))
-            # cosine 距离: 1 - cos_sim, 范围大致 [0,2]
-            grad_cost = 1.0 - cos_sim
-        else:
-            grad_cost = 0.0
+        #     # 避免全 0 梯度
+        #     normA = float(np.linalg.norm(gA)) + 1e-6
+        #     normB = float(np.linalg.norm(gB)) + 1e-6
+        #     cos_sim = float(np.dot(gA, gB) / (normA * normB))
+        #     # cosine 距离: 1 - cos_sim, 范围大致 [0,2]
+        #     grad_cost = 1.0 - cos_sim
+        # else:
+        #     grad_cost = 0.0
+        gA = np.diff(LA.astype(np.float32))
+        gB = np.diff(LB.astype(np.float32))
+        grad_cost = float(np.mean((gA - gB)**2))
 
         # ---------- 综合 cost ----------
         # color_mse 是平方误差，grad_cost 是无量纲方向差，给梯度一个较小权重
